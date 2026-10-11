@@ -245,3 +245,19 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
    自写 eager 参照漏了 `1/sqrt(d)` 缩放；补上后 SDPA 与 eager 差 3e-4。
    结论：**管线里的 attention 结果是正确的**，之前所有 TTS 音频不受影响。
    教训：怀疑库函数之前，先怀疑自己的参照。
+
+### 路线 A 实测 verdict（2026-10-12）：函数式 OV 单步在 decode 上打不过 torch XPU
+
+- IR 导出成功（`ov_models/gpt_step_b1k1024.xml`，51 in / 50 out，
+  `export_gpt_step_ov.py`）：OV 前端不支持 `index_put_`，cache 写改成算术
+  等价（`arange`+`==`+blend），B=1 bake，`bidx` 输入直接省掉。
+- 单步 logits 对 torch：maxdiff ~0.03（fp16 级别，正确；采样本就随机）。
+- 单步耗时（B=1, K=1024，同步后）：**torch XPU ~34ms < OV CPU ~56ms
+  < OV GPU ~88ms**；NPU 编译失败。88ms 里 host-device 拷贝只占 ~2ms
+  （48MB，走 shared 内存），大头是 OV GPU 在该图上的执行效率——
+  stateful 省掉的只是拷贝，救不了 compute，不值得继续。
+- **结论：GPT decode 的 forward 留在 torch XPU（oneDNN）就是当前最优**；
+  `infer()` 的 OV 接线（`gpt_step_ov.py` 已写好）因数字不达标**没有合入**。
+  想再压 decode，只能走路线 B（ggml 全融合）或接受现状。
+- 附带发现：XPU 上 SDPA 的 bool mask 语义实测是 **True=attend、False=mask**
+  （与文档字面相反），手写 mask/导出时必须照此语义（pad 补 False）。
