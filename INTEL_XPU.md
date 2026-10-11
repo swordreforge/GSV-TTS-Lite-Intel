@@ -259,5 +259,38 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
 - **结论：GPT decode 的 forward 留在 torch XPU（oneDNN）就是当前最优**；
   `infer()` 的 OV 接线（`gpt_step_ov.py` 已写好）因数字不达标**没有合入**。
   想再压 decode，只能走路线 B（ggml 全融合）或接受现状。
+
+### 路线 B 进展（2026-10-12）：地基三件套已验证
+
+1. **工具链**：`intel-oneapi-toolkit` 自带 DPC++（icx 2026.0）+ oneMKL；
+   llama.cpp（`~/llama.cpp`，shallow clone）CPU 构建通过，
+   SYCL 构建（`-DGGML_SYCL=ON`）进行中。
+2. **gguf 转换器**（`convert_t2s_gguf.py`）：s1v3.ckpt 295 张量全量转出，
+   arch 名 `gpt-sovits-t2s`，2D 权重按 ggml 惯例存 `[in,out]`，
+   embedding 存 `[dim,vocab]`，fp16；回读字节级校验通过。
+   输出：`~/.cache/gsv/gguf/t2s-s1v3-f16.gguf`。
+3. **单 block ggml 复刻**（`test_t2s_block.cpp` + `dump_t2s_block.py`）：
+   与 torch fp32 参照 **maxdiff=0.000000**。关键细节：
+   - T2SBlock 与 transformer 的 `decode_next_token` **参数顺序不同**，调错必炸；
+   - mask 语义 True=attend（与 XPU SDPA 实测一致），ggml 侧用显式 bias 实现，
+     不依赖任何后端的 SDPA；
+   - `ggml_norm` + 外挂 weight/bias 即 torch LayerNorm（有偏方差一致）；
+   - backend 接管内存时张量必须 `no_alloc` + `ggml_backend_tensor_set`，
+     不能提前 memcpy。
+4. 待做：SYCL 后端在 Arc 上的真实验证（小模型跑分）→ 24 层完整 runner →
+   embeddings/prefill/predict/采样 → SoVITS → 端到端对齐。
+
+### 路线 B 数值地基打通（2026-10-12）：24 层单步全量 maxdiff=0.000006
+
+- 布局规则（实测为准）：**ggml ne ↔ numpy 形状全逆序对应**，
+  torch `(B,H,T,D)` 的 cache 必须声明成 `[D,T,H,B]`（中间两维交换）。
+  权重 torch `[out,in]` 原字节声明 `[in,out]`。搞错一次就是静默错误，
+  且单测可能因维度小而恰好通过——必须全尺寸验证。
+- 全量对照：真实抓到的单步输入（K=512, kv=264），24 层 + predict，
+  vs torch fp32，logits **maxdiff=0.000006**。
+- 速度基线：CPU fp32（22 线程）单步约 20ms，已接近 torch XPU fp16 的 34ms；
+  切 SYCL + fp16 后预期大幅领先。
+- 剩下的是体力活：prefill/embeddings、采样循环 C++ 化、KV 跨步管理、
+  fp16/量化、SoVITS、SYCL 跑分优化。
 - 附带发现：XPU 上 SDPA 的 bool mask 语义实测是 **True=attend、False=mask**
   （与文档字面相反），手写 mask/导出时必须照此语义（pad 补 False）。
