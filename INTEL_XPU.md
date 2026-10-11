@@ -292,5 +292,18 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   切 SYCL + fp16 后预期大幅领先。
 - 剩下的是体力活：prefill/embeddings、采样循环 C++ 化、KV 跨步管理、
   fp16/量化、SoVITS、SYCL 跑分优化。
+
+### 路线 B：prefill 全 24 层验证通过 + 采样器 exact（2026-10-12）
+
+- prefill（L=263）：24 层逐层对照 torch，末层 1.4e-4（fp32 累积漂移内）。
+  关键修正：`view_3d` 切分必须带 qkv 真实 pitch（1536），`[32,16,L]` head
+  视图的 l 步长是 2048 字节；scores 保持 llama 式转置约定
+  （`mul(kh,qh)` + 转置 bias + dim0 softmax），与 torch flat 逐位一致。
+- 采样器：rep → top-p → top-k → softmax 的顺序必须与 torch 一致
+  （之前写反了）；duplicate token 的 penalty 只算一次（last-wins）；
+  cumsum 用 fp32 顺序累加。四个配置（plain/rep/topk/topp）全部 exact（≤5e-7）。
+- 参照系纪律：所有探针对照文件必须同轮生成；`tensor_get` 直读 strided view
+  是错位内存，必须 `cont` 后再读；转置/形状问题一律用 arange 小实验钉死，
+  不许猜。
 - 附带发现：XPU 上 SDPA 的 bool mask 语义实测是 **True=attend、False=mask**
   （与文档字面相反），手写 mask/导出时必须照此语义（pad 补 False）。
