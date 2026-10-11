@@ -72,10 +72,14 @@ class TTS:
             if self.tts_config.device.type in ["mps", "cpu"]:
                 self.tts_config.dtype = torch.float32
                 sovits_cache = []
+            elif self.tts_config.device.type == "xpu":
+                # Intel XPU (Arc) 使用 float16 快路径
+                self.tts_config.dtype = torch.float16
         if not dtype is None:
             dtype_map = {
                 "float32": torch.float32,
                 "float16": torch.float16,
+                "bfloat16": torch.bfloat16,
             }
 
             self.tts_config.dtype = dtype_map.get(dtype.lower(), torch.float32)
@@ -113,8 +117,15 @@ class TTS:
         check_pretrained_models(self.models_dir)
         
         if use_bert:
+            # OpenVINO 后端：只需要 PyTorch 权重目录（tokenizer + 导出 IR 用）
+            if os.environ.get("GSV_ROBERTA_BACKEND", "").lower() == "openvino":
+                if not os.path.exists(self.cnroberta_path):
+                    download_model(
+                        filename="chinese-roberta.zip",
+                        dir=self.models_dir,
+                    )
             # CPU 场景：下载 INT8 ONNX 模型
-            if self.tts_config.device.type == "cpu":
+            elif self.tts_config.device.type == "cpu":
                 int8_onnx_path = self.cnroberta_path / "cnroberta_int8_dynamic.onnx"
                 if not int8_onnx_path.exists():
                     download_cnroberta_int8(dir=self.cnroberta_path)
@@ -1734,59 +1745,56 @@ class TTS:
                 subtitle["end_s"] += increment
 
     def _viterbi_monotonic(self, attn: torch.Tensor):
-        B, T, N = attn.shape
+        # NOTE: 原实现是 T 步 XPU 小 kernel 循环，launch-bound（~90-260ms）。
+        # DP 本体是纯 CPU 逻辑，转 numpy 一次算完（~1ms），输出与原实现逐元素一致。
+        import numpy as np
         device = attn.device
+        attn_np = attn.detach().to("cpu", torch.float32).numpy()
+        B, T, N = attn_np.shape
 
-        max_idx = torch.argmax(attn, dim=-1)
+        max_idx = np.argmax(attn_np, axis=-1)
         mask = (max_idx != N - 1)
-        
-        masked_attn = attn * mask.unsqueeze(-1).float()
-        sum_attn = torch.sum(masked_attn, dim=0)
-        count = torch.sum(mask, dim=0).unsqueeze(-1)
 
-        default_distribution = torch.full((T, N), 1.0 / N, device=device)
-        default_distribution[:, N-1] = 0.9 / N
+        masked_attn = attn_np * mask[..., None].astype(np.float32)
+        sum_attn = masked_attn.sum(axis=0)
+        count = mask.sum(axis=0)[..., None]
+
+        default_distribution = np.full((T, N), 1.0 / N, dtype=np.float32)
+        default_distribution[:, N - 1] = 0.9 / N
         default_distribution[:, 1] = 1.1 / N
+        default_distribution /= default_distribution.sum(axis=-1, keepdims=True)
 
-        default_distribution /= default_distribution.sum(dim=-1, keepdim=True)
-
-        normal_attn = torch.where(
+        normal_attn = np.where(
             count > 0,
             sum_attn / (count + 1e-9),
             default_distribution
         )
 
-
-        normal_attn_argmax = torch.argmax(normal_attn, dim=-1)
-
+        normal_attn_argmax = np.argmax(normal_attn, axis=-1)
         is_zero = (normal_attn_argmax == 0)
+        first_zero_idx = int(np.where(is_zero)[0][0]) if is_zero.any() else 0
 
-        first_zero_idx = torch.where(is_zero)[0][0] if is_zero.any() else torch.tensor(0, device=device)
-
-        dp = torch.zeros((T, N), device=device)
-        ptr = torch.zeros((T, N), dtype=torch.long, device=device)
-        
+        dp = np.zeros((T, N), dtype=np.float32)
+        ptr = np.zeros((T, N), dtype=np.int64)
         dp[0] = normal_attn[0]
-        
+        neginf = np.float32(-np.inf)
+        arange_n = np.arange(N)
         for t in range(1, T):
-            prev_dp = dp[t-1]
-            prev_dp_shifted = torch.cat([torch.tensor([-float('inf')], device=device), prev_dp[:-1]])
-            
-            stacked = torch.stack([prev_dp, prev_dp_shifted], dim=0)
-            max_vals, relative_indices = torch.max(stacked, dim=0)
-            
-            dp[t] = normal_attn[t] + max_vals
-            ptr[t] = torch.arange(N, device=device) - relative_indices
+            prev_dp = dp[t - 1]
+            prev_dp_shifted = np.concatenate([[neginf], prev_dp[:-1]])
+            stacked = np.stack([prev_dp, prev_dp_shifted], axis=0)
+            relative_indices = np.argmax(stacked, axis=0)
+            dp[t] = normal_attn[t] + stacked[relative_indices, arange_n]
+            ptr[t] = arange_n - relative_indices
 
-        assign_path = torch.zeros(T, dtype=torch.long, device=device)
-        assign_path[-1] = torch.argmax(dp[-1])
-        
+        assign_path = np.zeros(T, dtype=np.int64)
+        assign_path[-1] = int(np.argmax(dp[-1]))
         for t in range(T - 2, -1, -1):
-            assign_path[t] = ptr[t+1, assign_path[t+1]]
+            assign_path[t] = ptr[t + 1, assign_path[t + 1]]
 
         assign_path[:first_zero_idx] = -1
 
-        return assign_path
+        return torch.from_numpy(assign_path).to(device)
     
     def _is_normal_assign(self, assign, threshold=0.5):
         x = assign[assign != -1]
@@ -1819,6 +1827,8 @@ class TTS:
             gc.collect()
             if self.tts_config.device.type == "cuda":
                 torch.cuda.empty_cache()
+            elif self.tts_config.device.type == "xpu":
+                torch.xpu.empty_cache()
             elif self.tts_config.device.type == "mps":
                 torch.mps.empty_cache()
         except:

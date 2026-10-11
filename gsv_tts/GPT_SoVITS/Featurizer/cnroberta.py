@@ -110,7 +110,16 @@ class CNRoberta(nn.Module):
         self.base_path = base_path
         self.tts_config = tts_config
         self.use_onnx = False
+        self.use_ov = False
         
+        import os
+        if os.environ.get("GSV_ROBERTA_BACKEND", "").lower() == "openvino":
+            from .roberta_ov import CNRobertaOV
+            ov_device = os.environ.get("GSV_OV_DEVICE", "GPU")
+            self.model = CNRobertaOV(base_path, tts_config, ov_device)
+            self.use_ov = True
+            return
+
         # 判断是否使用 ONNX (仅 CPU 场景)
         if tts_config.device.type == "cpu" and HAS_ONNXRUNTIME:
             onnx_path = Path(base_path) / "cnroberta_int8_dynamic.onnx" if isinstance(base_path, str) else base_path / "cnroberta_int8_dynamic.onnx"
@@ -127,6 +136,8 @@ class CNRoberta(nn.Module):
             self.model = None
     
     def forward(self, word2ph_list: List):
+        if self.use_ov:
+            return self.model(word2ph_list)
         if self.use_onnx:
             return self.model(word2ph_list)
         else:
