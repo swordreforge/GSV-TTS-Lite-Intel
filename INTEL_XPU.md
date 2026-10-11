@@ -226,3 +226,22 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
      `grep --line-buffered` + `python -u`。
    稳态耗时账本（短句，同步后）：GPT ~2.4s ≫ viterbi ~0.1–0.25s >
    flow_dec ~0.135s > enc_p ~0.02–0.26s（含 JIT 波动）。下一步只能动 GPT 主循环。
+
+### FlashAttention 强开实验（结论：torch 侧无 kernel，手写 Triton 可跑通但暂无收益）
+
+1. **torch 自带的 FA 在 Xe-LPG 上不存在**：`SDPBackend.FLASH_ATTENTION`
+   直接报 `No available kernel`（只给 PVC/BMG 编译了 kernel），
+   `flash_attn` 包是纯 CUDA 的，装不上——没有可"强开"的对象。
+2. **手写 Triton FA 在 Arc 上能跑且数值正确**（`try_triton_fa.py` /
+   `try_fa2.py` / `try_maskcheck.py`）：forward 与 torch XPU math-SDPA
+   差 2.4e-4。但注意三个坑：
+   - 管线用 bool mask，FA kernel 还需补 mask + `sm_scale` + decode 专用
+     `(q_len=1, KV-cache)` 形状才有实用价值；
+   - 当前未调优版本 (16,128,64) 约 2–3ms，反而比 math 后端（~0.4ms）慢，
+     要 autotune（block/warp/stage）后才有收益；
+   - `tl.exp` 在 triton-xpu 上只接受 fp32/fp64（fp16 直接编译报错），
+     写 kernel 时注意先 `.to(tl.float32)`。
+3. **参照系教训**：一度怀疑"XPU math-SDPA 算错了"（差 4.14），最后发现是
+   自写 eager 参照漏了 `1/sqrt(d)` 缩放；补上后 SDPA 与 eager 差 3e-4。
+   结论：**管线里的 attention 结果是正确的**，之前所有 TTS 音频不受影响。
+   教训：怀疑库函数之前，先怀疑自己的参照。
