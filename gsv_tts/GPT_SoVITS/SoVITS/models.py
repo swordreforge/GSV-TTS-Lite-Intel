@@ -193,12 +193,13 @@ class TextEncoder(nn.Module):
 
         self.y_overlap = None
     
-    def infer(self, y, text, ge, speed, stream_mode=False, valid_start_idx=None, overlap_len=None, slice_indices=None):
-        y_mask = torch.ones((1, 1, y.size(2)), dtype=y.dtype, device=y.device)
+    def infer(self, y, text, ge, speed, stream_mode=False, valid_start_idx=None, overlap_len=None, slice_indices=None, y_mask=None, text_mask=None):
+        if y_mask is None:
+            y_mask = torch.ones((1, 1, y.size(2)), dtype=y.dtype, device=y.device)
+        if text_mask is None:
+            text_mask = torch.ones((1, 1, text.size(1)), dtype=text.dtype, device=text.device)
         y = self.ssl_proj(y * y_mask) * y_mask
         y = self.encoder_ssl(y * y_mask, y_mask)
-
-        text_mask = torch.ones((1, 1, text.size(1)), dtype=text.dtype, device=text.device)
         text = self.text_embedding(text)
         text = text.transpose(1, 2)
         text = self.encoder_text(text * text_mask, text_mask)

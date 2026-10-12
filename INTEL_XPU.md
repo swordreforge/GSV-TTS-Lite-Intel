@@ -307,3 +307,27 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   不许猜。
 - 附带发现：XPU 上 SDPA 的 bool mask 语义实测是 **True=attend、False=mask**
   （与文档字面相反），手写 mask/导出时必须照此语义（pad 补 False）。
+
+### 路线 B：decode 闭环 + SYCL 提速 + SoVITS 定线（2026-10-12）
+
+- **cpy 死节点教训**：`ggml_cpy` 返回值丢弃则该节点永不进图（build 只访问
+  logits 祖先，alias 不算边），cache 从不更新。修法：收住 cpy 返回值，
+  先 expand 全部 cpy 再 expand logits。5 步 teacher-forcing 3e-6。
+- **closed-loop greedy**：emb+pos → 24 层 → predict → suppress → sampler
+  全闭环 248 步，logits 1.5e-5，token 全中。附带修了 `sampler.cpp` 的
+  latent bug（temp 除法放最前；torch 顺序是 rep→top-p→temp→top-k，
+  temp≠1 时原版会对不上）。
+- **SYCL Arc**：fp32 decode 30ms/步；SYCL build 是 `GGML_SYCL_F16: no`
+  （F16 内部转 fp32，无加速）。瓶颈是 launch（7057 节点/步）。
+  `flash_attn_ext` 走不通（head dim 32 被 oneDNN/MKL 两路拒，只要 ≥64）。
+  自研 batch 注意力（16 头并成 batch 维，一层 ~5 节点）：**~20ms/步**，
+  超过 torch XPU（~34ms）。fp16 精度 2e-3，argmax 全稳。
+- **SoVITS 定线**：瓶颈是 Generator（dec 5.7s/6.7s，enc_p 140ms，flow 45ms）。
+  OV 静态 IR：flow_dec 精确 shape 下 CPU 5e-5/GPU-f32 1~3e-3；
+  但 **pad+bucket 在 OV GPU 下全局炸**（flowdec 1.13，enc 11.0），
+  torch 同 pad 输入是 exact（4.6e-5）——OV shape 相关误编译，
+  bucket 路线放弃。enc_p 留 torch CPU（140ms 不值得搬）。
+  **torch XPU 是答案**：SoVITS 全量 662ms vs CPU 3181ms（4.8x），
+  maxdiff 1.4e-5。XPU 端到端（fp32）：3.2s 出 3.8s 音频，RTF 0.86。相关脚本：`probe_sovits*.py`、
+  `export_sovits_*.py`（参考）、`dump_sovits_in.py`、`run_sovits_xpu.py`。
+  `TextEncoder.infer` 加了可选 `y_mask/text_mask` 参数（向后兼容）。
