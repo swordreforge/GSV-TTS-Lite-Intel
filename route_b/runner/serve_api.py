@@ -106,12 +106,13 @@ class TTSReq(BaseModel):
     language: str = "ja"
     top_k: int = 15  # greedy 短句易塌成静音，默认随机采样
     seed: int = 1234
-    cut_minlen: int = 10
+    cut_minlen: int = 30  # 段越少总耗时越短；太大单段易撞 K=1024 上限被截断
     cut_mute: float = 0.4  # 段间静音秒数
 
 
 app = FastAPI(title="GSV-TTS-Lite Intel API")
 _lock = threading.Lock()
+_prog = {"state": "idle", "current": 0, "total": 0}  # 原子替换读，无锁可读
 _rsrv: RunnerServer | None = None
 _tts = None
 _tts_x = None
@@ -164,9 +165,12 @@ def _synth(req: TTSReq) -> str:
     cuts = cut_text(req.text, req.cut_minlen)
     if not cuts:
         raise ValueError("empty text after cut")
+    global _prog
+    _prog = {"state": "running", "current": 0, "total": len(cuts)}
     chunks = []
     with tempfile.TemporaryDirectory(prefix="api_job_") as wd:
         for i, tc in enumerate(cuts):
+            _prog = {"state": "running", "current": i + 1, "total": len(cuts)}
             phones2, _, bert2, _ = get_phones_and_bert(tc, tts.tts_config, req.language)
             x = torch.LongTensor(phones1 + phones2).unsqueeze(0)
             bert = torch.cat([bert1, bert2]).unsqueeze(0)
@@ -195,17 +199,25 @@ def _synth(req: TTSReq) -> str:
         wav = np.concatenate([wav, mute, c])
     out = os.path.join(tempfile.gettempdir(), f"api_tts_{int(time.time()*1000)}.wav")
     sf.write(out, wav, SR)
+    _prog = {"state": "idle", "current": 0, "total": 0}
     return out
+
+
+@app.get("/progress")
+def progress():
+    return _prog
 
 
 @app.post("/tts")
 def tts_endpoint(req: TTSReq):
+    global _prog
     if not req.text or not req.text.strip():
         raise HTTPException(400, "empty text")
     with _lock:  # runner 单通道 + XPU 状态，全局串行
         try:
             path = _synth(req)
         except Exception as e:
+            _prog = {"state": "idle", "current": 0, "total": 0}
             raise HTTPException(500, f"synth failed: {e}")
     return FileResponse(path, media_type="audio/wav", filename=os.path.basename(path))
 
