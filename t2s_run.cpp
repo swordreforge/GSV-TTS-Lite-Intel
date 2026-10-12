@@ -373,8 +373,10 @@ int main() {
     std::vector<int> prev;
     for (auto t : vy) prev.push_back((int)t);
     SampleOpt so;
-    so.top_k = 1; so.top_p = 1.0f; so.temp = 1.0f; so.rep = 1.35f;
+    so.top_k = getenv("RUNNER_TOP_K") ? atoi(getenv("RUNNER_TOP_K")) : 1;
+    so.top_p = 1.0f; so.temp = 1.0f; so.rep = 1.35f;
     std::mt19937 rng(1234);
+    printf("sampler: top_k=%d\n", so.top_k);
     std::vector<float> lg0(gotp.begin(), gotp.begin() + 1024);
     for (int j : SUPP) if (j < 1024) lg0[j] = -INFINITY;
     auto pr0 = logits_to_probs(lg0.data(), 1024, prev.data(), (int)prev.size(), so);
