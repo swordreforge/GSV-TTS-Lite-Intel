@@ -151,6 +151,7 @@ class TTSReq(BaseModel):
     language: str = "ja"
     prompt_language: str = "ja"  # 必须与 prompt 音频/文本的真实语言一致，否则 prompt 条件全错
     top_k: int = 15  # greedy 短句易塌成静音，默认随机采样
+    noise_scale: float = 0.5  # 上游默认；0=确定性但发 flat/金属（parity 工具仍用 0）
     repetition_penalty: float = 1.35
     seed: int | None = None  # None=每次随机；固定 seed 则回声等问题可复现
     cut_minlen: int = 30  # 段越少总耗时越短；太大单段易撞 K=1024 上限被截断
@@ -247,7 +248,7 @@ def _synth(req: TTSReq) -> str:
             with torch.inference_mode():
                 codes = torch.from_numpy(seq).unsqueeze(0).unsqueeze(0).to("xpu")
                 ph2 = torch.LongTensor(phones2).unsqueeze(0).to("xpu")
-                audio, _ = svx.decode(codes, ph2, ge.to("xpu"), cuda_graph=False, noise_scale=0)
+                audio, _ = svx.decode(codes, ph2, ge.to("xpu"), cuda_graph=False, noise_scale=req.noise_scale)
                 audio = audio[0, 0, :]
                 audio = audio[tts_x._find_head_threshold_offsets(audio):]
             chunks.append(audio.detach().cpu().numpy().reshape(-1))
@@ -321,7 +322,7 @@ def _synth_stream(req: StreamReq):
                 nonlocal vs, last_ov, first_win
                 with torch.inference_mode():
                     codes = torch.from_numpy(codes_np).unsqueeze(0).unsqueeze(0).to("xpu")
-                    audio, attn = svx.decode(codes, ph2, gex, noise_scale=0, cuda_graph=False,
+                    audio, attn = svx.decode(codes, ph2, gex, noise_scale=req.noise_scale, cuda_graph=False,
                                              stream_mode=True, valid_start_idx=vs,
                                              overlap_len=req.overlap_len)
                     if last_ov is not None:

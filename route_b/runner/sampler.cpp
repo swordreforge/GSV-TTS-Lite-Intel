@@ -13,6 +13,10 @@ struct SampleOpt {
     float top_p = 1.0f;
     float temp = 1.0f;
     float rep = 1.35f;
+    // serving-only 抗 prompt 复述：禁止生成 prompt 内出现过的 n-gram 续写。
+    // 只查 prompt 区（前 plen 个），生成区的正常重复（停顿等）不受影响。0=关闭。
+    int nrn = 0;
+    int nrn_plen = 0;
 };
 
 // 返回 probs（已含全部 mask）；idx 用 probs 做 exponential multinomial
@@ -20,6 +24,20 @@ static std::vector<float> logits_to_probs(const float * logits, int V,
                                           const int * prev, int nprev,
                                           const SampleOpt & o) {
     std::vector<float> lg(logits, logits + V);
+    // 抗 prompt 复述（serving-only，torch 无此逻辑）：当前尾 n-1 个若命中 prompt 内 n-gram，
+    // 则禁掉其后继 token
+    if (o.nrn >= 2 && o.nrn_plen > 0 && nprev >= o.nrn - 1) {
+        int n = o.nrn, plen = o.nrn_plen < nprev ? o.nrn_plen : nprev;
+        for (int j = 0; j + n <= plen; j++) {
+            bool hit = true;
+            for (int k = 0; k < n - 1; k++)
+                if (prev[j + k] != prev[nprev - (n - 1) + k]) { hit = false; break; }
+            if (hit) {
+                int ban = prev[j + n - 1];
+                if (ban >= 0 && ban < V) lg[ban] = -INFINITY;
+            }
+        }
+    }
     // 与 torch logits_to_probs 一致：rep（raw 上） -> top-p -> temp -> top-k
     if (nprev > 0 && o.rep != 1.0f) {
         // 与 torch 对齐：先 gather 原值、变换、scatter（重复 token 只算一次，last-wins）
