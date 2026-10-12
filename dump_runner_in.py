@@ -27,7 +27,7 @@ t2s = list(tts.gpt_models.values())[0].t2s_model.eval()
 
 KW = dict(spk_audio_path="examples/laffey.mp3", prompt_audio_path="examples/AnAn.ogg",
           prompt_audio_text="ちが……ちがう。レイア、貴様は間違っている。",
-          text="へぇー、ここまでしてくれるんですね。")
+          text=os.environ.get("GSV_UTT_TEXT", "へぇー、ここまでしてくれるんですね。"))
 
 cap = {}
 orig_psd = t2s.process_single_data

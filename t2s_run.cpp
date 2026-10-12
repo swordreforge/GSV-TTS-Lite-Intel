@@ -19,7 +19,7 @@ static const char * GGUF_PATH = "/home/swordreforge/.cache/gsv/gguf/t2s-s1v3-f16
 static const char * RDIR = "/tmp/opencode/t2s_run/";
 static const char * CDIR = "/tmp/opencode/t2s_closed/";
 static const char * EDIR = "/tmp/opencode/t2s_emb/";
-static const int K = 512;
+static const int K = 1024;  // 覆盖 645 步 greedy（torch bucket 到 786）
 static const char * ARCH = "gpt-sovits-t2s";
 static const int EOS_ID = 1024;
 static const int SUPP[3] = {280, 486, 1024};
@@ -102,7 +102,7 @@ int main() {
     gguf_load();
     std::string A = ARCH;
 
-    struct ggml_init_params params = { 1024ULL * 1024 * 1024, nullptr, true };
+    struct ggml_init_params params = { 2048ULL * 1024 * 1024, nullptr, true };  // SYCL+CPU 双份权重
     ggml_context * ctx = ggml_init(params);
 
     // ---- 建全部 tensor（alloc 之前） ----
@@ -348,13 +348,13 @@ int main() {
 
     // prefill cache 校验（vs closed dump post-prefill）
     {
-        auto k0 = load_f32(CDIR, "kc0", (size_t)HD * K * H);
+        auto k0 = load_f32(CDIR, "kc0", (size_t)HD * 512 * H);  // 文件 512 宽，只对前半
         std::vector<uint8_t> raw((size_t)HD * K * H * 2);
         ggml_backend_tensor_get(kc[0], raw.data(), 0, raw.size());
         auto * h = (ggml_fp16_t *)raw.data();
         float m = 0;
         for (int hh = 0; hh < H; hh++)
-            for (int t = 0; t < K; t++)
+            for (int t = 0; t < 512; t++)
                 for (int d = 0; d < HD; d++) {
                     float a = ggml_fp16_to_fp32(h[d + HD * t + HD * K * hh]);
                     float b = k0[(size_t)hh * K * HD + t * HD + d];
@@ -374,13 +374,15 @@ int main() {
     for (int j : SUPP) if (j < 1024) lg0[j] = -INFINITY;
     auto pr0 = logits_to_probs(lg0.data(), 1024, prev.data(), (int)prev.size(), so);
     int t_cur = multinomial_exp(pr0, rng);
-    auto tref0 = load_i64(CDIR, "tokens", 761);
+    int NSTEPS_ALL = (int)load_i64(CDIR, "nsteps", 1)[0];
+    auto tref0 = load_i64(CDIR, "tokens", NSTEPS_ALL);
     printf("t0=%d ref=%lld %s\n", t_cur, (long long)tref0[0], t_cur == tref0[0] ? "OK" : "MISMATCH");
 
     // ================= DECODE LOOP =================
-    auto tnext = load_i64(CDIR, "tokens_next", 761);
-    int ln = L, nsteps = 0, NSTEPS = 248;
+    auto tnext = load_i64(CDIR, "tokens_next", NSTEPS_ALL);
+    int ln = L, nsteps = 0, NSTEPS = NSTEPS_ALL;
     if (ln + NSTEPS > K) NSTEPS = K - ln - 1;
+    printf("NSTEPS=%d (dump %d)\n", NSTEPS, NSTEPS_ALL);
     bool allok = (t_cur == tref0[0]);
     prev.push_back(t_cur);
     for (int s = 0; s < NSTEPS; s++) {
@@ -452,6 +454,18 @@ int main() {
         if ((s + 1) % 5 == 0 && tout == EOS_ID) break;
     }
     printf(allok ? "RUNNER ALL OK steps=%d\n" : "RUNNER DIVERGED\n", nsteps);
+    {
+        const char * op = getenv("RUNNER_TOKENS_OUT");
+        if (op) {
+            FILE * f = fopen(op, "wb");
+            // prev = y + sampled：只存 sampled 部分
+            size_t ylen = vy.size();
+            std::vector<int64_t> toks;
+            for (size_t i = ylen; i < prev.size(); i++) toks.push_back(prev[i]);
+            fwrite(toks.data(), 8, toks.size(), f); fclose(f);
+            printf("tokens saved: %d to %s\n", (int)toks.size(), op);
+        }
+    }
     ggml_free(ctx);
     return allok ? 0 : 1;
 }

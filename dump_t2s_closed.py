@@ -29,8 +29,8 @@ t2s = list(tts.gpt_models.values())[0].t2s_model.eval()
 
 KW = dict(spk_audio_path="examples/laffey.mp3", prompt_audio_path="examples/AnAn.ogg",
           prompt_audio_text="ちが……ちがう。レイア、貴様は間違っている。",
-          text="へぇー、ここまでしてくれるんですね。",
-          top_k=1, top_p=1.0, temperature=1.0, repetition_penalty=1.35)
+          text=os.environ.get("GSV_UTT_TEXT", "へぇー、ここまでしてくれるんですね。"),
+          top_k=1, top_p=1.0, temperature=1.0, repetition_penalty=1.35, noise_scale=0)
 
 box = {}
 orig_infer = t2s.infer
@@ -102,7 +102,18 @@ def wpsd(x, y, bert):
                xy=xy.detach().cpu().clone(), mk=mk.detach().cpu().clone())
     return xy, mk
 t2s.process_single_data = wpsd
-tts.infer(**KW)
+# SoVITS 输入/音频捕获
+svcap = {}
+svm = list(tts.sovits_models.values())[0].vq_model.eval()
+orig_svdec = svm.decode
+def wsvdec(codes, text, ge, **kw):
+    svcap.update(codes=codes.detach().cpu().clone(), text=text.detach().cpu().clone(),
+                 ge=ge.detach().cpu().clone())
+    o, attn = orig_svdec(codes, text, ge, **{**kw, "cuda_graph": False, "noise_scale": 0})
+    svcap["audio"] = o.detach().cpu().clone()
+    return o, attn
+svm.decode = wsvdec
+r = tts.infer(**KW)
 N = len(dec_inputs)
 print(f"dec_steps={N}, sample_calls={len(sample_calls)}, x_len={box['x_len']}, EOS={t2s.EOS}", flush=True)
 
@@ -143,6 +154,10 @@ with torch.inference_mode():
     supp = [1 if (s + 1) < 10 else 0 for s in range(N)]
     sv("suppressed", np.array(supp, dtype=np.int64))
     sv("nsteps", np.array([N], dtype=np.int64))
+    sv("sv_codes", svcap["codes"].numpy().astype(np.int64))
+    sv("sv_text", svcap["text"].numpy().astype(np.int64))
+    sv("sv_ge", svcap["ge"].numpy())
+    sv("sv_audio", svcap["audio"].numpy())
     sv("xlen_ylen", np.array([psd["x"].shape[1], psd["y"].shape[1]], dtype=np.int64))
     sv("x_ids", psd["x"].numpy().astype(np.int64))
     sv("bert", psd["bert"].numpy())
