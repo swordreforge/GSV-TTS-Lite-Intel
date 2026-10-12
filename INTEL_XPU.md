@@ -333,6 +333,8 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   `POST /tts` 切分长文本串行合成。验收：短句 10s 真语音（rms 0.1)，第二请求 29s→7s。
 - **长文本**：cut_minlen 默认 30 + `GET /progress`（current/total）。
   1800 字：7 分钟出 11 分钟音频（段少静音垫料少；同文本上次 17.9 分钟系分段差异+采样方差）。
+- **三语可用**：中文/英文短句经 API 出声正常（6s，rms 0.09，无塌陷）；
+  内容级验证需人耳或 ASR（环境无 whisper，电平+时长只证明非静默非乱码）。
 - **按 token 流式**（`POST /tts/stream`，f32le 裸流）：runner `TOK` 行驱动，
   每 25 token 一窗 SoVITS（valid_start+sola，同 torch stream 规则），首音秒级。
   短句：流式 5.8s vs 非流式 6.3s（差交叠裁剪+头静音，符合预期）。
