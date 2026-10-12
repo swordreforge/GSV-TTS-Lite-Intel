@@ -329,6 +329,8 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
 - **启动开销**：SYCL 持久缓存本环境必崩（`getItemFromDisc` 段错误，空目录也崩），
   常驻无效，改 `--serve` 常驻进程：权重+SYCL JIT 驻留，job 级/步级 ctx 按次建删。
   同 job 双跑：19s→12.5s，tokens 与单次逐位一致。二进制放 `~/.cache/gsv/bin`（/tmp 重启丢）。
+- **API 服务**（`route_b/runner/serve_api.py :9880`）：常驻 runner + CPU准备/XPU解码，
+  `POST /tts` 切分长文本串行合成。验收：短句 10s 真语音（rms 0.1)，第二请求 29s→7s。
   血泪教训：
   - gguf 文件字节 = torch.T 的 C-order（writer 又转了一次，和 converter
     的 transpose 抵消）；host 侧一律按 torch 行序理解，逐张量字节级 H-test。
