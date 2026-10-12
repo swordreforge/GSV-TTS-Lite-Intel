@@ -18,6 +18,8 @@ static const int H = 16, HD = 32, DIM = 512, NL = 24, VOCAB = 1025;
 static const char * GGUF_PATH = "/home/swordreforge/.cache/gsv/gguf/t2s-s1v3-f16.gguf";
 static const char * RDIR = "/tmp/opencode/t2s_run/";
 static const char * CDIR = "/tmp/opencode/t2s_closed/";
+static std::string IDIR() { const char * e = getenv("RUNNER_IN_DIR"); return e ? e : CDIR; }
+static bool VALIDATE() { const char * e = getenv("RUNNER_VALIDATE"); return !e || atoi(e); }
 static const char * EDIR = "/tmp/opencode/t2s_emb/";
 static const int K = 1024;  // 覆盖 645 步 greedy（torch bucket 到 786）
 static const char * ARCH = "gpt-sovits-t2s";
@@ -90,11 +92,11 @@ int main() {
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
 
     // ---- 输入（host） ----
-    auto xyl = load_i64(CDIR, "xlen_ylen", 2);
+    auto xyl = load_i64(IDIR(), "xlen_ylen", 2);
     int X = (int)xyl[0], Y = (int)xyl[1], L = X + Y;
-    auto vx = load_i64(CDIR, "x_ids", X);
-    auto vy = load_i64(CDIR, "y", Y);
-    FILE * fb = fopen((std::string(CDIR) + "bert.bin").c_str(), "rb");
+    auto vx = load_i64(IDIR(), "x_ids", X);
+    auto vy = load_i64(IDIR(), "y", Y);
+    FILE * fb = fopen((IDIR() + "bert.bin").c_str(), "rb");
     std::vector<float> vbert((size_t)X * 1024);
     if (fread(vbert.data(), 4, vbert.size(), fb) != vbert.size()) { printf("bert short\n"); return 1; }
     fclose(fb);
@@ -258,21 +260,24 @@ int main() {
         for (int d = 0; d < 512; d++)
             xy[(size_t)(X + yi) * 512 + d] = emb_a[(size_t)tid * 512 + d] + alpha_a * pe[(size_t)yi * 512 + d];
     }
-    {
-        auto vxy = load_f32(CDIR, "xy_ref", (size_t)L * 512);
+    if (VALIDATE()) {
+        auto vxy = load_f32(IDIR(), "xy_ref", (size_t)L * 512);
         float m = 0;
         for (size_t i = 0; i < xy.size(); i++) { float dd = fabsf(xy[i] - vxy[i]); if (dd > m) m = dd; }
         printf("entry xy maxdiff=%.7f\n", m);
     }
-    // prompt bias [L,L,16]（全头同 pattern）
-    auto vpm = load_u8(CDIR, "prompt_mask", (size_t)H * L * L);
-    {
+    // prompt bias [L,L,16]（全头同 pattern；公式已验证 bad=0，prod 直接生成）
+    std::vector<uint8_t> vpm((size_t)H * L * L);
+    for (int h = 0; h < H; h++)
+        for (int r = 0; r < L; r++)
+            for (int c = 0; c < L; c++)
+                vpm[(size_t)h * L * L + r * L + c] =
+                    (r < X) ? (c < X ? 1 : 0) : ((c < X || c - X <= r - X) ? 1 : 0);
+    if (VALIDATE()) {
+        auto vpmf = load_u8(IDIR(), "prompt_mask", (size_t)H * L * L);
         int bad = 0;
-        for (int r = 0; r < L; r++) for (int c = 0; c < L; c++) {
-            uint8_t e = (r < X) ? (c < X ? 1 : 0) : ((c < X || c - X <= r - X) ? 1 : 0);
-            if (vpm[r * L + c] != e) bad++;
-        }
-        printf("prompt mask formula check: bad=%d\n", bad);
+        for (size_t i = 0; i < vpm.size(); i++) if (vpm[i] != vpmf[i]) bad++;
+        printf("prompt mask file-vs-formula bad=%d\n", bad);
     }
     // scores dst[m=key_t,n=query_t,h]；torch mask[query,key] -> bias[m,n] = mask[n,m]
     std::vector<float> pb((size_t)L * L * H);
@@ -339,15 +344,15 @@ int main() {
         ggml_backend_tensor_set(kc[i], kcb.data(), 0, kcb.size());
         ggml_backend_tensor_set(vc[i], vcb.data(), 0, vcb.size());
     }
-    {
-        auto vpr = load_f32("/tmp/opencode/", "torch_pflogits", VOCAB);
+    if (VALIDATE()) {
+        auto vpr = load_f32(IDIR(), "torch_pflogits", VOCAB);
         float m = 0;
         for (int j = 0; j < VOCAB; j++) { float dd = fabsf(gotp[j] - vpr[j]); if (dd > m) m = dd; }
         printf("prefill logits maxdiff=%.6f\n", m);
     }
 
     // prefill cache 校验（vs closed dump post-prefill）
-    {
+    if (VALIDATE()) {
         auto k0 = load_f32(CDIR, "kc0", (size_t)HD * 512 * H);  // 文件 512 宽，只对前半
         std::vector<uint8_t> raw((size_t)HD * K * H * 2);
         ggml_backend_tensor_get(kc[0], raw.data(), 0, raw.size());
@@ -374,16 +379,22 @@ int main() {
     for (int j : SUPP) if (j < 1024) lg0[j] = -INFINITY;
     auto pr0 = logits_to_probs(lg0.data(), 1024, prev.data(), (int)prev.size(), so);
     int t_cur = multinomial_exp(pr0, rng);
-    int NSTEPS_ALL = (int)load_i64(CDIR, "nsteps", 1)[0];
-    auto tref0 = load_i64(CDIR, "tokens", NSTEPS_ALL);
-    printf("t0=%d ref=%lld %s\n", t_cur, (long long)tref0[0], t_cur == tref0[0] ? "OK" : "MISMATCH");
+    int NSTEPS_ALL = 0;
+    std::vector<int64_t> tref0, tnext;
+    if (VALIDATE()) {
+        NSTEPS_ALL = (int)load_i64(IDIR(), "nsteps", 1)[0];
+        tref0 = load_i64(IDIR(), "tokens", NSTEPS_ALL);
+        printf("t0=%d ref=%lld %s\n", t_cur, (long long)tref0[0], t_cur == tref0[0] ? "OK" : "MISMATCH");
+    } else {
+        printf("t0=%d (prod mode)\n", t_cur);
+    }
 
     // ================= DECODE LOOP =================
-    auto tnext = load_i64(CDIR, "tokens_next", NSTEPS_ALL);
-    int ln = L, nsteps = 0, NSTEPS = NSTEPS_ALL;
+    if (VALIDATE()) tnext = load_i64(IDIR(), "tokens_next", NSTEPS_ALL);
+    int ln = L, nsteps = 0, NSTEPS = VALIDATE() ? NSTEPS_ALL : (K - ln - 1);
     if (ln + NSTEPS > K) NSTEPS = K - ln - 1;
-    printf("NSTEPS=%d (dump %d)\n", NSTEPS, NSTEPS_ALL);
-    bool allok = (t_cur == tref0[0]);
+    printf("NSTEPS=%d\n", NSTEPS);
+    bool allok = VALIDATE() ? (t_cur == tref0[0]) : true;
     prev.push_back(t_cur);
     for (int s = 0; s < NSTEPS; s++) {
         // entry：xy = emb[t_cur]*1 + alpha_a*pe[ln - X]
@@ -443,10 +454,14 @@ int main() {
         if (sup) for (int j : SUPP) got[j] = -INFINITY;
         auto pr = logits_to_probs(got.data(), VOCAB, prev.data(), (int)prev.size(), so);
         int tout = multinomial_exp(pr, rng);
-        int expect = (int)tnext[s];
-        if (s < 3 || s % 50 == 0 || tout != expect)
-            printf("  step %d tok=%d expect=%d %s time=%.1fms\n", s, tout, expect, tout == expect ? "OK" : "MISMATCH", dms);
-        if (tout != expect) { allok = false; break; }
+        if (VALIDATE()) {
+            int expect = (int)tnext[s];
+            if (s < 3 || s % 50 == 0 || tout != expect)
+                printf("  step %d tok=%d expect=%d %s time=%.1fms\n", s, tout, expect, tout == expect ? "OK" : "MISMATCH", dms);
+            if (tout != expect) { allok = false; break; }
+        } else if (s < 3 || s % 50 == 0) {
+            printf("  step %d tok=%d time=%.1fms\n", s, tout, dms);
+        }
         prev.push_back(tout);
         t_cur = tout;
         ln++;
