@@ -337,6 +337,10 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   每 25 token 一窗 SoVITS（valid_start+sola，同 torch stream 规则），首音秒级。
   短句：流式 5.8s vs 非流式 6.3s（差交叠裁剪+头静音，符合预期）。
   血泪教训：sola/head 的 alpha 建在 CPU TTS device 上，音频在 XPU——调 XPU 实例方法。
+- **专属模型陷阱**：gguf 必须全 2D 转置存储（runner 运行时转回），提交版 converter
+  存 raw 从没产出过可用 gguf——唯一验证过的 00:05 文件是转置版。已修（转出逐字节一致），
+  微调 ckpt 同架构可直接 `--src` 重转；SoVITS `.pth` 经 API `sovits_model` 字段即插即用，
+  GPT 换 gguf 重启服务（`GPT_GGUF`，多模型=多端口）。
   - gguf 文件字节 = torch.T 的 C-order（writer 又转了一次，和 converter
     的 transpose 抵消）；host 侧一律按 torch 行序理解，逐张量字节级 H-test。
   - 3D bias 的 host 填充必须按 ggml F-order 语义（C-order 填必转置错：
