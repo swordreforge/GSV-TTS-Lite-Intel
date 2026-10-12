@@ -343,6 +343,10 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   同语言回声 0~1（干净），跨语言 prompt 回声 3（serving 已剥）；
   225 token 跨语言惯性是模型 OOD 行为（首段 0% prompt 复读=新生成），治本要同语言 prompt。
   另：inline `python3 -c` 里 `$s` 会被 shell 吞掉造成幻读，普查必须写脚本文件。
+- **终极仲裁**（中文输入）：runner greedy vs 纯 torch greedy 逐 token 一致
+  （`torch_greedy_zh.py`；贪心双方都塌成 239，模型行为）。
+  C++ 侧无辜实锤：随机采样的前缀/回声是模型+采样器行为，同条件 torch 一样有；
+  serving 侧 strip/随机 seed 是在上游行为之上做质量修正。
 - **专属模型陷阱**：gguf 必须全 2D 转置存储（runner 运行时转回），提交版 converter
   存 raw 从没产出过可用 gguf——唯一验证过的 00:05 文件是转置版。已修（转出逐字节一致），
   微调 ckpt 同架构可直接 `--src` 重转；SoVITS `.pth` 经 API `sovits_model` 字段即插即用，
