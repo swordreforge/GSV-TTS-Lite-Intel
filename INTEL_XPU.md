@@ -333,7 +333,10 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   `POST /tts` 切分长文本串行合成。验收：短句 10s 真语音（rms 0.1)，第二请求 29s→7s。
 - **长文本**：cut_minlen 默认 30 + `GET /progress`（current/total）。
   1800 字：7 分钟出 11 分钟音频（段少静音垫料少；同文本上次 17.9 分钟系分段差异+采样方差）。
-  血泪教训：
+- **按 token 流式**（`POST /tts/stream`，f32le 裸流）：runner `TOK` 行驱动，
+  每 25 token 一窗 SoVITS（valid_start+sola，同 torch stream 规则），首音秒级。
+  短句：流式 5.8s vs 非流式 6.3s（差交叠裁剪+头静音，符合预期）。
+  血泪教训：sola/head 的 alpha 建在 CPU TTS device 上，音频在 XPU——调 XPU 实例方法。
   - gguf 文件字节 = torch.T 的 C-order（writer 又转了一次，和 converter
     的 transpose 抵消）；host 侧一律按 torch 行序理解，逐张量字节级 H-test。
   - 3D bias 的 host 填充必须按 ggml F-order 语义（C-order 填必转置错：
