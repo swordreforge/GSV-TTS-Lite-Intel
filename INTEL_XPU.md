@@ -341,6 +341,9 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   存 raw 从没产出过可用 gguf——唯一验证过的 00:05 文件是转置版。已修（转出逐字节一致），
   微调 ckpt 同架构可直接 `--src` 重转；SoVITS `.pth` 经 API `sovits_model` 字段即插即用，
   GPT 换 gguf 重启服务（`GPT_GGUF`，多模型=多端口）。
+- **TILE 融合关线**：triton FA 在 XPU 上数值错误（maxdiff 4.14）且比 torch math 慢 6x
+  （3.17ms vs 0.53ms，N=128）。attention 本来只占 step 零头（step 17ms 是全图 launch-bound），
+  融了也省不出 1.3x。
 - **SoVITS 加速结论（无油水，关线）**：dec 占 92%（1540/1680ms），纯算力 conv。
   fp16 证伪（maxdiff 0.31）；torch.compile exact 但仅 1.17x 且 46s/shape；
   OV bucket 早前已证伪。dec RTF 0.06 本来就行，请求耗时大头是 GPT decode。
