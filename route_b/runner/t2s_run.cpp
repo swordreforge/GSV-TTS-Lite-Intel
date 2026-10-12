@@ -397,6 +397,19 @@ static int run_job(int * ntoks_out) {
     so.top_p = 1.0f; so.temp = 1.0f;
     so.rep = getenv("RUNNER_REP") ? (float)atof(getenv("RUNNER_REP")) : 1.35f;
     printf("sampler: top_k=%d rep=%.2f\n", so.top_k, so.rep);
+    // teacher-forcing：RUNNER_FORCE_FILE 指定 token 序列（含t0），逐 yo步喂入不采样
+    std::vector<int> forced;
+    if (getenv("RUNNER_FORCE_FILE")) {
+        FILE * ff = fopen(getenv("RUNNER_FORCE_FILE"), "rb");
+        if (ff) {
+            fseek(ff, 0, SEEK_END); size_t n = ftell(ff) / 8; fseek(ff, 0, SEEK_SET);
+            std::vector<int64_t> tmp(n);
+            if (fread(tmp.data(), 8, n, ff) == n)
+                for (auto v : tmp) forced.push_back((int)v);
+            fclose(ff);
+        }
+        printf("teacher-forcing: %d toks\n", (int)forced.size());
+    }
     std::mt19937 rng(getenv("RUNNER_SEED") ? atoi(getenv("RUNNER_SEED")) : 1234);
 
     std::vector<float> lg0(gotp.begin(), gotp.begin() + 1024);
@@ -408,6 +421,7 @@ static int run_job(int * ntoks_out) {
         if (pf0) { fwrite(pr0.data(), 4, 1024, pf0); fclose(pf0); pf0 = (FILE *)1; }
     }
     int t_cur = multinomial_exp(pr0, rng);
+    if (!forced.empty()) t_cur = forced[0];
     bool stream = getenv("RUNNER_STREAM") && atoi(getenv("RUNNER_STREAM"));
     if (stream) printf("TOK %d\n", t_cur);
     int NSTEPS_ALL = 0;
@@ -488,12 +502,14 @@ static int run_job(int * ntoks_out) {
         bool sup = (s + 1) < 10;
         if (sup) for (int j : SUPP) got[j] = -INFINITY;
         auto pr = logits_to_probs(got.data(), VOCAB, prev.data(), (int)prev.size(), so);
+        bool is_forced = (int)forced.size() > s + 1;
         if (getenv("DUMP_PROBS_DIR")) {
             static FILE * pf = nullptr;
             if (!pf) { char pp[600]; snprintf(pp, 600, "%s/probs.bin", getenv("DUMP_PROBS_DIR")); pf = fopen(pp, "wb"); }
             if (pf) fwrite(pr.data(), 4, VOCAB, pf);
         }
         int tout = multinomial_exp(pr, rng);
+        if (is_forced) tout = forced[s + 1];
         if (stream) printf("TOK %d\n", tout);
         if (VALIDATE()) {
             int expect = (int)tnext[s];

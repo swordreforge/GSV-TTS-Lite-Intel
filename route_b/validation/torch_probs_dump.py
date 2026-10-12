@@ -27,8 +27,8 @@ import gsv_tts.GPT_SoVITS.GPT.t2s_model as TM
 from gsv_tts.GPT_SoVITS.GPT.utils import logits_to_probs as _ltp
 from gsv_tts.TTS import get_phones_and_bert as _gpb
 
-TRAJ = np.fromfile("/tmp/opencode/rate5/toks_1.bin", np.int64)
-OUT = open("/tmp/opencode/torch_probs.bin", "wb")
+TRAJ = np.fromfile(os.environ.get("FORCE_TRAJ", "/tmp/opencode/rate5/toks_1.bin"), np.int64)
+OUT = open(os.environ.get("FORCE_PROBS_OUT", "/tmp/opencode/torch_probs.bin"), "wb")
 rec = {"step": 0}
 
 
@@ -37,7 +37,7 @@ def forced(logits, pre_tokens, **kw):
     probs = _ltp(logits=logits, previous_tokens=pre_tokens, **kw)
     pr = probs.detach().cpu().float().reshape(-1).numpy()
     if i == 0:
-        open("/tmp/opencode/torch_probs0.bin", "wb").write(pr.astype(np.float32).tobytes())
+        open(os.environ.get("FORCE_PROBS0_OUT", "/tmp/opencode/torch_probs0.bin"), "wb").write(pr.astype(np.float32).tobytes())
     else:
         OUT.write(pr.astype(np.float32).tobytes())
     want = int(TRAJ[i]) if i < len(TRAJ) else int(np.argmax(pr))

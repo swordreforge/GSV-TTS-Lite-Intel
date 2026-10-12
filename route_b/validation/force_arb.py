@@ -26,18 +26,33 @@ _F.scaled_dot_product_attention = _eager_sdpa
 import gsv_tts.GPT_SoVITS.GPT.t2s_model as TM
 from gsv_tts.GPT_SoVITS.GPT.utils import logits_to_probs as _ltp
 
-TRAJ = np.fromfile("/tmp/opencode/rate5/toks_1.bin", np.int64)  # 完整含t0
+TRAJ = np.fromfile(os.environ.get("FORCE_TRAJ", "/tmp/opencode/rate5/toks_1.bin"), np.int64)  # 完整含t0
 print("forcing len:", len(TRAJ), flush=True)
 
 rec = {"step": 0, "rows": []}
 orig_sample = TM.sample
 
 
+T0_ONLY = os.environ.get("T0_ONLY") == "1"
+T0_TOK = int(np.fromfile("/tmp/opencode/rate5/toks_1.bin", np.int64)[0])
+
+
 def forced(logits, pre_tokens, **kw):
     i = rec["step"]
+    if T0_ONLY and i == 0:
+        # 首抽强制 runner t0，之后完全自由（orig 采样）
+        out, probs = orig_sample(logits, pre_tokens, **kw)
+        rec["rows"].append(("forced-t0",))
+        rec["step"] += 1
+        return torch.tensor([[T0_TOK]]), probs
     probs = _ltp(logits=logits, previous_tokens=pre_tokens, **kw)
     pr = probs.detach().cpu().float().reshape(-1)
     topv, topi = torch.topk(pr, min(15, pr.numel()))
+    if T0_ONLY and i > 0:
+        out_t, _ = orig_sample(logits, pre_tokens, **kw)
+        rec["rows"].append(("free", int(out_t)))
+        rec["step"] += 1
+        return out_t, probs
     want = int(TRAJ[i]) if i < len(TRAJ) else int(torch.argmax(pr))
     pe = float(pr[1024]) if pr.numel() > 1024 else 0.0
     rec["rows"].append((want, int(topi[0]), bool((topi == want).any()),
@@ -65,6 +80,9 @@ bert = torch.cat([bert1, bert2]).unsqueeze(0)
 with torch.inference_mode():
     out = t2s.infer(x, prompt, bert, top_k=15, top_p=1.0, temperature=1.0,
                     repetition_penalty=1.35)
+o = out[0, 0].cpu().numpy() if out.dim() == 3 else out.cpu().numpy().reshape(-1)
+o.astype(np.int64).tofile("/tmp/opencode/t0swap_toks.bin")
+print("saved tokens len:", len(o), flush=True)
 print("forced steps:", rec["step"], flush=True)
 outside = [(i, w, float(p)) for i, (w, a, inside, pe, p, am) in enumerate(rec["rows"]) if not inside]
 print("runner-pick-outside-torch-top15:", len(outside), outside[:10], flush=True)
