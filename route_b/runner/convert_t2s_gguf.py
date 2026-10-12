@@ -28,14 +28,20 @@ ARCH = "gpt-sovits-t2s"
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="微调 ckpt（同架构）-> gguf，同架构权重即插即用")
+    ap.add_argument("--src", default=str(SRC))
+    ap.add_argument("--dst", default=str(DST))
+    args = ap.parse_args()
+    src, dst = Path(args.src), Path(args.dst)
     print("loading ckpt...", flush=True)
-    d = torch.load(SRC, map_location="cpu", weights_only=False)
+    d = torch.load(src, map_location="cpu", weights_only=False)
     cfg = d["config"]["model"]
     w = d["weight"]
     print("tensors:", len(w), flush=True)
 
-    DST.parent.mkdir(parents=True, exist_ok=True)
-    wname = str(DST)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    wname = str(dst)
     writer = GGUFWriter(wname, ARCH)
 
     # hyper-parameters
@@ -46,7 +52,7 @@ def main():
     writer.add_uint32(f"{ARCH}.phoneme_vocab_size", cfg["phoneme_vocab_size"])
     writer.add_uint32(f"{ARCH}.eos_token_id", cfg["EOS"])
     writer.add_array(f"{ARCH}.suppressed_tokens", [280, 486, cfg["EOS"]])
-    writer.add_string(f"{ARCH}.source_ckpt", "s1v3.ckpt")
+    writer.add_string(f"{ARCH}.source_ckpt", src.name)
 
     def add(name, t, transpose=False):
         a = np.ascontiguousarray(t.detach().numpy())
@@ -55,24 +61,24 @@ def main():
         writer.add_tensor(name, a, raw_dtype=GGMLQuantizationType.F16)
 
     g = lambda n: w["model." + n]
-    add(f"{ARCH}.ar_text_emb.weight", g("ar_text_embedding.word_embeddings.weight"))
-    add(f"{ARCH}.ar_audio_emb.weight", g("ar_audio_embedding.word_embeddings.weight"))
+    add(f"{ARCH}.ar_text_emb.weight", g("ar_text_embedding.word_embeddings.weight"), True)
+    add(f"{ARCH}.ar_audio_emb.weight", g("ar_audio_embedding.word_embeddings.weight"), True)
     add(f"{ARCH}.ar_text_pos_alpha", g("ar_text_position.alpha"))
     add(f"{ARCH}.ar_audio_pos_alpha", g("ar_audio_position.alpha"))
-    add(f"{ARCH}.bert_proj.weight", g("bert_proj.weight"))
+    add(f"{ARCH}.bert_proj.weight", g("bert_proj.weight"), True)
     add(f"{ARCH}.bert_proj.bias", g("bert_proj.bias"))
-    add(f"{ARCH}.predict.weight", g("ar_predict_layer.weight"))
+    add(f"{ARCH}.predict.weight", g("ar_predict_layer.weight"), True)
 
     n_layer = cfg["n_layer"]
     for i in range(n_layer):
         p = f"h.layers.{i}."
-        add(f"{ARCH}.blk.{i}.qkv.weight", w["model." + p + "self_attn.in_proj_weight"])
+        add(f"{ARCH}.blk.{i}.qkv.weight", w["model." + p + "self_attn.in_proj_weight"], True)
         add(f"{ARCH}.blk.{i}.qkv.bias", w["model." + p + "self_attn.in_proj_bias"])
-        add(f"{ARCH}.blk.{i}.out.weight", w["model." + p + "self_attn.out_proj.weight"])
+        add(f"{ARCH}.blk.{i}.out.weight", w["model." + p + "self_attn.out_proj.weight"], True)
         add(f"{ARCH}.blk.{i}.out.bias", w["model." + p + "self_attn.out_proj.bias"])
-        add(f"{ARCH}.blk.{i}.mlp1.weight", w["model." + p + "linear1.weight"])
+        add(f"{ARCH}.blk.{i}.mlp1.weight", w["model." + p + "linear1.weight"], True)
         add(f"{ARCH}.blk.{i}.mlp1.bias", w["model." + p + "linear1.bias"])
-        add(f"{ARCH}.blk.{i}.mlp2.weight", w["model." + p + "linear2.weight"])
+        add(f"{ARCH}.blk.{i}.mlp2.weight", w["model." + p + "linear2.weight"], True)
         add(f"{ARCH}.blk.{i}.mlp2.bias", w["model." + p + "linear2.bias"])
         add(f"{ARCH}.blk.{i}.n1.weight", w["model." + p + "norm1.weight"])
         add(f"{ARCH}.blk.{i}.n1.bias", w["model." + p + "norm1.bias"])

@@ -64,6 +64,8 @@ class RunnerServer:
         self._env = dict(os.environ)
         self._env["SYCL_CACHE_PERSISTENT"] = "0"  # 持久缓存本环境段错误，见 INTEL_XPU.md
         self._env["RUNNER_STREAM"] = "1"  # 每步打印 TOK <id>，job() 会忽略，job_stream() 消费
+        if os.environ.get("GPT_GGUF"):  # 微调 GPT 的 gguf，重启服务切换
+            self._env["RUNNER_GGUF"] = os.environ["GPT_GGUF"]
         self._spawn()
 
     def _spawn(self):
@@ -141,6 +143,8 @@ class TTSReq(BaseModel):
     seed: int = 1234
     cut_minlen: int = 30  # 段越少总耗时越短；太大单段易撞 K=1024 上限被截断
     cut_mute: float = 0.4  # 段间静音秒数
+    sovits_model: str | None = None  # 微调 .pth 即插即用；None=默认
+    # GPT 微调切换=换 gguf，需重启服务（GPT_GGUF 环境变量指向新 gguf，多模型=多端口实例）
 
 
 app = FastAPI(title="GSV-TTS-Lite Intel API")
@@ -189,9 +193,9 @@ def _synth(req: TTSReq) -> str:
 
     tts, tts_x = _get_tts()
     tts.init_language_module(req.language)
-    svx = list(tts_x.sovits_models.values())[0].vq_model.eval()
-
-    sovits_m, ge = tts._prepare_sovits_resources(str(tts.default_sovits_path), req.spk)
+    sv_path = req.sovits_model or str(tts.default_sovits_path)
+    sovits_m, ge = tts_x._prepare_sovits_resources(sv_path, req.spk)
+    svx = sovits_m.vq_model.eval()
     gpt_m, prompt, phones1, bert1 = tts._prepare_gpt_resources(
         str(tts.default_gpt_path), req.prompt_audio, req.prompt_text, req.language)
 
@@ -253,10 +257,10 @@ def _synth_stream(req: StreamReq):
 
     tts, tts_x = _get_tts()
     tts.init_language_module(req.language)
-    svx = list(tts_x.sovits_models.values())[0].vq_model.eval()
+    sv_path = req.sovits_model or str(tts.default_sovits_path)
+    sovits_m, ge = tts_x._prepare_sovits_resources(sv_path, req.spk)
+    svx = sovits_m.vq_model.eval()
     overlap_samples = req.overlap_len * svx.samples_per_frame
-
-    sovits_m, ge = tts._prepare_sovits_resources(str(tts.default_sovits_path), req.spk)
     gpt_m, prompt, phones1, bert1 = tts._prepare_gpt_resources(
         str(tts.default_gpt_path), req.prompt_audio, req.prompt_text, req.language)
     cuts = cut_text(req.text, req.cut_minlen)

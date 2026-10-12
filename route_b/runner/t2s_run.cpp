@@ -17,7 +17,8 @@
 #include <chrono>
 
 static const int H = 16, HD = 32, DIM = 512, NL = 24, VOCAB = 1025;
-static const char * GGUF_PATH = "/home/swordreforge/.cache/gsv/gguf/t2s-s1v3-f16.gguf";
+static const char * GGUF_DEFAULT = "/home/swordreforge/.cache/gsv/gguf/t2s-s1v3-f16.gguf";
+static std::string GGUF_PATH() { const char * e = getenv("RUNNER_GGUF"); return e ? e : GGUF_DEFAULT; }
 static const char * CDIR = "/tmp/opencode/t2s_closed/";
 static std::string IDIR() { const char * e = getenv("RUNNER_IN_DIR"); return e ? e : CDIR; }
 static bool VALIDATE() { const char * e = getenv("RUNNER_VALIDATE"); return !e || atoi(e); }
@@ -31,13 +32,14 @@ static std::vector<uint8_t> g_gguf_data;
 static std::map<std::string, std::pair<size_t, size_t>> g_map;
 
 static void gguf_load() {
-    FILE * f = fopen(GGUF_PATH, "rb");
+    std::string gp = GGUF_PATH();
+    FILE * f = fopen(gp.c_str(), "rb");
     if (!f) { printf("no gguf\n"); exit(1); }
     fseek(f, 0, SEEK_END); size_t sz = ftell(f); fseek(f, 0, SEEK_SET);
     g_gguf_data.resize(sz);
     if (fread(g_gguf_data.data(), 1, sz, f) != sz) { printf("read short\n"); exit(1); }
     fclose(f);
-    FILE * f2 = fopen(GGUF_PATH, "rb");
+    FILE * f2 = fopen(gp.c_str(), "rb");
     struct gguf_init_params p = { true, nullptr };
     struct gguf_context * ctx = gguf_init_from_file_ptr(f2, p);
     if (!ctx) { printf("gguf parse fail\n"); exit(1); }
