@@ -42,6 +42,16 @@ EOS = 1024
 SR = 32000
 
 
+def strip_prompt_echo(sampled, prompt, maxk=12, mink=3):
+    """去头部 prompt 回声：sampled 头部若为 prompt 尾的续写则剥掉（只剥一次）。
+    sampled=去t0 EOS截断后；prompt=y 的 numpy。serving 质量修正，parity 工具不用。"""
+    n = min(len(sampled), len(prompt), maxk)
+    for k in range(n, mink - 1, -1):
+        if list(sampled[:k]) == list(prompt[-k:]):
+            return sampled[k:]
+    return sampled
+
+
 def _ensure_oneapi_env():
     if os.environ.get("ONEAPI_ROOT"):
         return
@@ -141,7 +151,7 @@ class TTSReq(BaseModel):
     language: str = "ja"
     prompt_language: str = "ja"  # 必须与 prompt 音频/文本的真实语言一致，否则 prompt 条件全错
     top_k: int = 15  # greedy 短句易塌成静音，默认随机采样
-    seed: int = 1234
+    seed: int | None = None  # None=每次随机；固定 seed 则回声等问题可复现
     cut_minlen: int = 30  # 段越少总耗时越短；太大单段易撞 K=1024 上限被截断
     cut_mute: float = 0.4  # 段间静音秒数
     sovits_model: str | None = None  # 微调 .pth 即插即用；None=默认
@@ -220,13 +230,19 @@ def _synth(req: TTSReq) -> str:
             np.ascontiguousarray(bert.numpy()).tofile(os.path.join(jd, "bert.bin"))
             np.array([x.shape[1], prompt.shape[1]], dtype=np.int64).tofile(os.path.join(jd, "xlen_ylen.bin"))
             tokbin = os.path.join(jd, "tokens.bin")
-            _rsrv.job(jd + "/", tokbin, top_k=req.top_k, seed=req.seed + i)
+            import random as _rd
+            base_seed = req.seed if req.seed is not None else _rd.randint(0, 2**31 - 1)
+            _rsrv.job(jd + "/", tokbin, top_k=req.top_k, seed=base_seed + i)
             toks = np.fromfile(tokbin, np.int64)
-            # torch 切片规则复刻：去 t0，首个 EOS 截断（driver.py:130）
+            # torch 切片规则复刻：去 t0，首个 EOS 截断（driver.py:130），再剥 prompt 回声
             seq = toks[1:]
             eos = np.where(seq == EOS)[0]
             if len(eos):
                 seq = seq[:eos[0]]
+            n0 = len(seq)
+            seq = strip_prompt_echo(seq, prompt.numpy().reshape(-1))
+            if len(seq) != n0:
+                print(f"echo stripped: {n0} -> {len(seq)}", flush=True)
             with torch.inference_mode():
                 codes = torch.from_numpy(seq).unsqueeze(0).unsqueeze(0).to("xpu")
                 ph2 = torch.LongTensor(phones2).unsqueeze(0).to("xpu")
@@ -286,8 +302,12 @@ def _synth_stream(req: StreamReq):
             np.array([x.shape[1], prompt.shape[1]], dtype=np.int64).tofile(os.path.join(jd, "xlen_ylen.bin"))
             ph2 = torch.LongTensor(phones2).unsqueeze(0).to("xpu")
 
+            import random as _rd
+            base_seed = req.seed if req.seed is not None else _rd.randint(0, 2**31 - 1)
+            py = prompt.numpy().reshape(-1)
             sampled = []  # 含 t0；可用序列 = sampled[1:]
-            emitted = 0   # 已解码的可用 token 数
+            emitted = 0   # 已解码的可用 token 数（去回声后起算）
+            skip = None   # 回声长度，首窗/flush 前一次性判定
             vs = 0        # valid_start_idx（TTS.infer_stream 同规则）
             last_ov = None
             first_win = True
@@ -319,24 +339,33 @@ def _synth_stream(req: StreamReq):
                     return audio.float().cpu().numpy()
 
             def on_token(tid):
-                nonlocal emitted
+                nonlocal emitted, skip
                 sampled.append(tid)
-                usable = len(sampled) - 1  # 去 t0
+                if skip is None and len(sampled) - 1 >= 12:
+                    n0 = len(sampled) - 1
+                    skip = n0 - len(strip_prompt_echo(np.array(sampled[1:]), py))
+                    if skip:
+                        print(f"echo stripped: skip={skip}", flush=True)
+                base = 1 + (skip or 0)
+                usable = len(sampled) - base
                 # EOS 出现后停发新窗，留给 final flush
-                if usable - emitted >= req.stream_chunk and EOS not in sampled[1:]:
-                    seq = np.array(sampled[1:], dtype=np.int64)
+                if usable - emitted >= req.stream_chunk and EOS not in sampled[base:]:
+                    seq = np.array(sampled[base:], dtype=np.int64)
                     q.put(decode_window(seq, False))
                     emitted = usable
 
             _rsrv.job_stream(jd + "/", os.path.join(jd, "tokens.bin"),
-                             top_k=req.top_k, seed=req.seed + i, on_token=on_token)
+                             top_k=req.top_k, seed=base_seed + i, on_token=on_token)
             while not q.empty():
                 yield q.get().astype(np.float32).tobytes()
-            # final flush：首个 EOS 截断（同非流式规则）
+            # final flush：首个 EOS 截断 + 回声剥离（同非流式规则）
             seq = np.array(sampled[1:], dtype=np.int64)
             eos = np.where(seq == EOS)[0]
             if len(eos):
                 seq = seq[:eos[0]]
+            if skip is None:
+                skip = len(seq) - len(strip_prompt_echo(seq, py))
+            seq = seq[skip:]
             if len(seq) > emitted:
                 pcm = decode_window(seq, True)
                 yield pcm.astype(np.float32).tobytes()
