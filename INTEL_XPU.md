@@ -341,6 +341,9 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   存 raw 从没产出过可用 gguf——唯一验证过的 00:05 文件是转置版。已修（转出逐字节一致），
   微调 ckpt 同架构可直接 `--src` 重转；SoVITS `.pth` 经 API `sovits_model` 字段即插即用，
   GPT 换 gguf 重启服务（`GPT_GGUF`，多模型=多端口）。
+- **SoVITS 加速结论（无油水，关线）**：dec 占 92%（1540/1680ms），纯算力 conv。
+  fp16 证伪（maxdiff 0.31）；torch.compile exact 但仅 1.17x 且 46s/shape；
+  OV bucket 早前已证伪。dec RTF 0.06 本来就行，请求耗时大头是 GPT decode。
   - gguf 文件字节 = torch.T 的 C-order（writer 又转了一次，和 converter
     的 transpose 抵消）；host 侧一律按 torch 行序理解，逐张量字节级 H-test。
   - 3D bias 的 host 填充必须按 ggml F-order 语义（C-order 填必转置错：
