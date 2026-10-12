@@ -339,6 +339,10 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   每 25 token 一窗 SoVITS（valid_start+sola，同 torch stream 规则），首音秒级。
   短句：流式 5.8s vs 非流式 6.3s（差交叠裁剪+头静音，符合预期）。
   血泪教训：sola/head 的 alpha 建在 CPU TTS device 上，音频在 XPU——调 XPU 实例方法。
+- **回声普查**（`route_b/validation/echo_census.py`）：seed 生效且跨进程确定；
+  同语言回声 0~1（干净），跨语言 prompt 回声 3（serving 已剥）；
+  225 token 跨语言惯性是模型 OOD 行为（首段 0% prompt 复读=新生成），治本要同语言 prompt。
+  另：inline `python3 -c` 里 `$s` 会被 shell 吞掉造成幻读，普查必须写脚本文件。
 - **专属模型陷阱**：gguf 必须全 2D 转置存储（runner 运行时转回），提交版 converter
   存 raw 从没产出过可用 gguf——唯一验证过的 00:05 文件是转置版。已修（转出逐字节一致），
   微调 ckpt 同架构可直接 `--src` 重转；SoVITS `.pth` 经 API `sovits_model` 字段即插即用，
