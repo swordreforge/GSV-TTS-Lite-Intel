@@ -94,9 +94,9 @@ class RunnerServer:
             print("runner dead, respawning...", flush=True)
             self._spawn()
 
-    def job(self, indir, out, top_k=15, seed=1234, timeout=1200):
+    def job(self, indir, out, top_k=15, seed=1234, rep=1.35, timeout=1200):
         self._ensure_alive()
-        self.p.stdin.write(f"JOB {indir} {out} {top_k} {seed}\n")
+        self.p.stdin.write(f"JOB {indir} {out} {top_k} {seed} {rep}\n")
         self.p.stdin.flush()
         t0 = time.time()
         while True:
@@ -111,10 +111,10 @@ class RunnerServer:
             if line.startswith("JOB-ERR"):
                 raise RuntimeError(f"runner: {line.strip()}")
 
-    def job_stream(self, indir, out, top_k=15, seed=1234, on_token=None, timeout=1200):
+    def job_stream(self, indir, out, top_k=15, seed=1234, rep=1.35, on_token=None, timeout=1200):
         """JOB 并逐 token 回调（RUNNER_STREAM=1 时 runner 每步打印 TOK <id>）。"""
         self._ensure_alive()
-        self.p.stdin.write(f"JOB {indir} {out} {top_k} {seed}\n")
+        self.p.stdin.write(f"JOB {indir} {out} {top_k} {seed} {rep}\n")
         self.p.stdin.flush()
         t0 = time.time()
         while True:
@@ -151,6 +151,7 @@ class TTSReq(BaseModel):
     language: str = "ja"
     prompt_language: str = "ja"  # 必须与 prompt 音频/文本的真实语言一致，否则 prompt 条件全错
     top_k: int = 15  # greedy 短句易塌成静音，默认随机采样
+    repetition_penalty: float = 1.35
     seed: int | None = None  # None=每次随机；固定 seed 则回声等问题可复现
     cut_minlen: int = 30  # 段越少总耗时越短；太大单段易撞 K=1024 上限被截断
     cut_mute: float = 0.4  # 段间静音秒数
@@ -232,7 +233,7 @@ def _synth(req: TTSReq) -> str:
             tokbin = os.path.join(jd, "tokens.bin")
             import random as _rd
             base_seed = req.seed if req.seed is not None else _rd.randint(0, 2**31 - 1)
-            _rsrv.job(jd + "/", tokbin, top_k=req.top_k, seed=base_seed + i)
+            _rsrv.job(jd + "/", tokbin, top_k=req.top_k, seed=base_seed + i, rep=req.repetition_penalty)
             toks = np.fromfile(tokbin, np.int64)
             # torch 切片规则复刻：去 t0，首个 EOS 截断（driver.py:130），再剥 prompt 回声
             seq = toks[1:]
@@ -247,6 +248,8 @@ def _synth(req: TTSReq) -> str:
                 codes = torch.from_numpy(seq).unsqueeze(0).unsqueeze(0).to("xpu")
                 ph2 = torch.LongTensor(phones2).unsqueeze(0).to("xpu")
                 audio, _ = svx.decode(codes, ph2, ge.to("xpu"), cuda_graph=False, noise_scale=0)
+                audio = audio[0, 0, :]
+                audio = audio[tts_x._find_head_threshold_offsets(audio):]
             chunks.append(audio.detach().cpu().numpy().reshape(-1))
     mute = np.zeros(int(req.cut_mute * SR), dtype=np.float32)
     wav = chunks[0]
@@ -355,7 +358,8 @@ def _synth_stream(req: StreamReq):
                     emitted = usable
 
             _rsrv.job_stream(jd + "/", os.path.join(jd, "tokens.bin"),
-                             top_k=req.top_k, seed=base_seed + i, on_token=on_token)
+                             top_k=req.top_k, seed=base_seed + i, rep=req.repetition_penalty,
+                             on_token=on_token)
             while not q.empty():
                 yield q.get().astype(np.float32).tobytes()
             # final flush：首个 EOS 截断 + 回声剥离（同非流式规则）
