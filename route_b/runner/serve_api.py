@@ -139,6 +139,7 @@ class TTSReq(BaseModel):
     prompt_audio: str = "examples/AnAn.ogg"
     prompt_text: str = "ちが……ちがう。レイア、貴様は間違っている。"
     language: str = "ja"
+    prompt_language: str = "ja"  # 必须与 prompt 音频/文本的真实语言一致，否则 prompt 条件全错
     top_k: int = 15  # greedy 短句易塌成静音，默认随机采样
     seed: int = 1234
     cut_minlen: int = 30  # 段越少总耗时越短；太大单段易撞 K=1024 上限被截断
@@ -192,12 +193,12 @@ def _synth(req: TTSReq) -> str:
     import soundfile as sf
 
     tts, tts_x = _get_tts()
-    tts.init_language_module(req.language)
+    tts.init_language_module(req.language, req.prompt_language)
     sv_path = req.sovits_model or str(tts.default_sovits_path)
     sovits_m, ge = tts_x._prepare_sovits_resources(sv_path, req.spk)
     svx = sovits_m.vq_model.eval()
     gpt_m, prompt, phones1, bert1 = tts._prepare_gpt_resources(
-        str(tts.default_gpt_path), req.prompt_audio, req.prompt_text, req.language)
+        str(tts.default_gpt_path), req.prompt_audio, req.prompt_text, req.prompt_language)
 
     cuts = cut_text(req.text, req.cut_minlen)
     if not cuts:
@@ -256,13 +257,13 @@ def _synth_stream(req: StreamReq):
     from gsv_tts.TextProcessor import cut_text
 
     tts, tts_x = _get_tts()
-    tts.init_language_module(req.language)
+    tts.init_language_module(req.language, req.prompt_language)
     sv_path = req.sovits_model or str(tts.default_sovits_path)
     sovits_m, ge = tts_x._prepare_sovits_resources(sv_path, req.spk)
     svx = sovits_m.vq_model.eval()
     overlap_samples = req.overlap_len * svx.samples_per_frame
     gpt_m, prompt, phones1, bert1 = tts._prepare_gpt_resources(
-        str(tts.default_gpt_path), req.prompt_audio, req.prompt_text, req.language)
+        str(tts.default_gpt_path), req.prompt_audio, req.prompt_text, req.prompt_language)
     cuts = cut_text(req.text, req.cut_minlen)
     if not cuts:
         raise ValueError("empty text after cut")
