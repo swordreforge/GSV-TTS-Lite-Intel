@@ -319,7 +319,7 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   temp≠1 时原版会对不上）。
 - **runner 落地**（`t2s_run.cpp`，SYCL）：gguf 直读 + pe 现场生成 + entry
   + prefill + 248 步 decode 闭环，token 全中（decode ~15ms/步，
-  prefill 一次性 7s）。血泪教训：
+  prefill CPU 化后 0.23s（SYCL 跨步 batch 慢 35x，decode 不受影响）。血泪教训：
   - gguf 文件字节 = torch.T 的 C-order（writer 又转了一次，和 converter
     的 transpose 抵消）；host 侧一律按 torch 行序理解，逐张量字节级 H-test。
   - 3D bias 的 host 填充必须按 ggml F-order 语义（C-order 填必转置错：
