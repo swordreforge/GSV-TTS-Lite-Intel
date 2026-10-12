@@ -90,6 +90,8 @@ def main():
     env["RUNNER_VALIDATE"] = "0"
     env["RUNNER_TOKENS_OUT"] = os.path.join(args.workdir, "tokens.bin")
     env["RUNNER_TOP_K"] = str(args.top_k)
+    # SYCL 持久化 kernel 缓存 /tmp 重启后可能损坏致段错误（getItemFromDisc），直接禁用
+    env["SYCL_CACHE_PERSISTENT"] = "0"
     r = subprocess.run([RUNNER_BIN], env=env, capture_output=True, text=True)
     print(r.stdout[-1500:] if len(r.stdout) > 1500 else r.stdout, flush=True)
     if r.returncode != 0:
