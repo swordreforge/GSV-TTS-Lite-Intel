@@ -20,7 +20,7 @@ static std::vector<float> logits_to_probs(const float * logits, int V,
                                           const int * prev, int nprev,
                                           const SampleOpt & o) {
     std::vector<float> lg(logits, logits + V);
-    for (int i = 0; i < V; i++) lg[i] /= std::max(o.temp, 1e-5f);
+    // 与 torch logits_to_probs 一致：rep（raw 上） -> top-p -> temp -> top-k
     if (nprev > 0 && o.rep != 1.0f) {
         // 与 torch 对齐：先 gather 原值、变换、scatter（重复 token 只算一次，last-wins）
         std::vector<char> done(V, 0);
@@ -72,6 +72,8 @@ static std::vector<float> logits_to_probs(const float * logits, int V,
         for (int i = 0; i < V; i++)
             if (rem[i]) lg[idx[i]] = NEG;
     }
+    // torch 顺序：rep -> top-p -> temp 除法 -> top-k
+    for (int i = 0; i < V; i++) lg[i] /= std::max(o.temp, 1e-5f);
     if (o.top_k > 0) {
         int k = std::min(o.top_k, V);
         std::vector<float> cp = lg;
