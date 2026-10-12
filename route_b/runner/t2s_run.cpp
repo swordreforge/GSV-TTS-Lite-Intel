@@ -417,6 +417,7 @@ static int run_job(int * ntoks_out) {
     if (VALIDATE()) tnext = load_i64(IDIR(), "tokens_next", NSTEPS_ALL);
     int ln = L, nsteps = 0, NSTEPS = VALIDATE() ? NSTEPS_ALL : (K - ln - 1);
     if (ln + NSTEPS > K) NSTEPS = K - ln - 1;
+    if (getenv("RUNNER_MAX_STEPS")) { int m = atoi(getenv("RUNNER_MAX_STEPS")); if (m < NSTEPS) NSTEPS = m; }
     printf("NSTEPS=%d\n", NSTEPS);
     bool allok = VALIDATE() ? (t_cur == tref0[0]) : true;
     prev.push_back(t_cur);
