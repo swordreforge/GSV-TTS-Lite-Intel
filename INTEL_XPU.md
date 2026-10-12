@@ -317,6 +317,16 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   全闭环 248 步，logits 1.5e-5，token 全中。附带修了 `sampler.cpp` 的
   latent bug（temp 除法放最前；torch 顺序是 rep→top-p→temp→top-k，
   temp≠1 时原版会对不上）。
+- **runner 落地**（`t2s_run.cpp`，SYCL）：gguf 直读 + pe 现场生成 + entry
+  + prefill + 248 步 decode 闭环，token 全中（decode ~15ms/步，
+  prefill 一次性 7s）。血泪教训：
+  - gguf 文件字节 = torch.T 的 C-order（writer 又转了一次，和 converter
+    的 transpose 抵消）；host 侧一律按 torch 行序理解，逐张量字节级 H-test。
+  - 3D bias 的 host 填充必须按 ggml F-order 语义（C-order 填必转置错：
+    `pb[m+L*n+L²h] = mask(q=n,k=m)`）。
+  - 中间张量探针读数不可信（gallocr 复用踩踏）：只信 buf 张量和末端输出；
+    分段验证必须每段独立成图只读末端。
+  - prompt token 跨轮不稳定（22/184 差异，源头未定）：参照必须同轮 dump。
 - **SYCL Arc**：fp32 decode 30ms/步；SYCL build 是 `GGML_SYCL_F16: no`
   （F16 内部转 fp32，无加速）。瓶颈是 launch（7057 节点/步）。
   `flash_attn_ext` 走不通（head dim 32 被 oneDNN/MKL 两路拒，只要 ≥64）。
