@@ -322,6 +322,8 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   prefill CPU 化后 0.23s（SYCL 跨步 batch 慢 35x，decode 不受影响）。
 - **端到端 parity**：短句（54字）greedy 全程：C++ runner 645 步 token 全中，
   切片对齐（torch 切掉 t0）后 SoVITS XPU 音频 maxdiff 4e-6。cache K 扩到 1024。
+- **driver 可用**（`driver.py`）：活文本 → TTS特征准备 → runner → SoVITS →
+  wav。随机采样（top_k=15）260 步 EOS 停止，165 个不同 token，音频电平正常。
   血泪教训：
   - gguf 文件字节 = torch.T 的 C-order（writer 又转了一次，和 converter
     的 transpose 抵消）；host 侧一律按 torch 行序理解，逐张量字节级 H-test。
