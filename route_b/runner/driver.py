@@ -23,7 +23,12 @@ def _eager_sdpa(q, k, v, attn_mask=None, scale=None, **kw):
     return (torch.softmax(s, dim=-1) @ v.float()).to(q.dtype)
 _F.scaled_dot_product_attention = _eager_sdpa
 
-RUNNER_BIN = "/tmp/opencode/t2s_runner"
+RUNNER_BIN = os.environ.get(
+    "RUNNER_BIN",
+    os.path.join(os.path.expanduser("~"), ".cache", "gsv", "bin", "t2s_runner"),
+)
+if not os.path.exists(RUNNER_BIN) and os.path.exists("/tmp/opencode/t2s_runner"):
+    RUNNER_BIN = "/tmp/opencode/t2s_runner"
 
 
 def _ensure_oneapi_env():
