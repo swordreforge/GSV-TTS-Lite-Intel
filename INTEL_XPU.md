@@ -345,7 +345,12 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   另：inline `python3 -c` 里 `$s` 会被 shell 吞掉造成幻读，普查必须写脚本文件。
 - **终极仲裁**（中文输入）：runner greedy vs 纯 torch greedy 逐 token 一致
   （`torch_greedy_zh.py`；贪心双方都塌成 239，模型行为）。
-  C++ 侧无辜实锤：随机采样的前缀/回声是模型+采样器行为，同条件 torch 一样有；
+  C++ 侧无辜实锤（分布级）：145 步逐 yo步 TV 距离 1e-6、top-15 全同、t0 TV 3e-7、
+  forced 下 144/146 在 torch top-15 内、EOS 时机一致。贪心精确只是 argmax 一致，
+  这次是整分布一致。长度率差异（runner 长 vs torch 短）是采样流运气+小样本，
+  非系统性计算 bug（suppression/切片/EOS/精度逐项对过，均一致）。
+  fp16 曾被怀疑：纯 torch fp16 权重跑退化，但 ckpt 本就全 fp16 且 torch 照样 cast 跑，
+  对照实为 RNG 运气；runner 已转 fp32 计算，贪心仍 exact。
   自指测试（prompt 文本生成 prompt 音频）：输出 393 token 含 0 个 prompt 子串（≥10），
   同语言无泄露；音频互相关的多处“匹配”是同音色假阳性。真问题是口吃（29 处三连重复，
   时长翻倍），上游采样器行为，靠随机 seed + 必要时 repetition_penalty 缓解。
