@@ -200,6 +200,7 @@ def _synth(req: TTSReq) -> str:
     gpt_m, prompt, phones1, bert1 = tts._prepare_gpt_resources(
         str(tts.default_gpt_path), req.prompt_audio, req.prompt_text, req.prompt_language)
 
+    print(f"tts lang={req.language} prompt_lang={req.prompt_language} text={req.text[:20]!r}", flush=True)
     cuts = cut_text(req.text, req.cut_minlen)
     if not cuts:
         raise ValueError("empty text after cut")
@@ -264,6 +265,7 @@ def _synth_stream(req: StreamReq):
     overlap_samples = req.overlap_len * svx.samples_per_frame
     gpt_m, prompt, phones1, bert1 = tts._prepare_gpt_resources(
         str(tts.default_gpt_path), req.prompt_audio, req.prompt_text, req.prompt_language)
+    print(f"tts lang={req.language} prompt_lang={req.prompt_language} text={req.text[:20]!r}", flush=True)
     cuts = cut_text(req.text, req.cut_minlen)
     if not cuts:
         raise ValueError("empty text after cut")
