@@ -6,7 +6,7 @@
 #include "ggml-alloc.h"
 #include "ggml-sycl.h"
 #include <chrono>
-#include "sampler.cpp"
+#include "../runner/sampler.cpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>

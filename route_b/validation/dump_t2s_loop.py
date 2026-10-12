@@ -1,6 +1,11 @@
 """Dump 真实循环前 5 步的 (xy_pos, logits)，C++ 回放验证 KV 跨步管理。"""
 import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+# 仓库根（route_b/ 下脚本需回退两级）
+_ROOT = os.path.dirname(os.path.dirname(_HERE)) if os.path.basename(os.path.dirname(_HERE)) == "route_b" else _HERE
+if _ROOT != _HERE:
+    sys.path.insert(0, _ROOT)
 from pathlib import Path
 import torch
 import numpy as np

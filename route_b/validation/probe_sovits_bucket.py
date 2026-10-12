@@ -1,6 +1,11 @@
 """Bucket 概念验证：导出 Fb=1024/Tb=64 的 IR，pad 输入跑完 crop，对比精确 shape torch ref。"""
 import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+# 仓库根（route_b/ 下脚本需回退两级）
+_ROOT = os.path.dirname(os.path.dirname(_HERE)) if os.path.basename(os.path.dirname(_HERE)) == "route_b" else _HERE
+if _ROOT != _HERE:
+    sys.path.insert(0, _ROOT)
 import torch, time, copy
 import numpy as np
 import openvino as ov

@@ -261,6 +261,8 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   想再压 decode，只能走路线 B（ggml 全融合）或接受现状。
 
 ### 路线 B 进展（2026-10-12）：地基三件套已验证
+（本节所有文件在 `route_b/` 下：`runner/` 是交付物，
+`validation/` 是一次性验证脚本，均从仓库根目录运行）
 
 1. **工具链**：`intel-oneapi-toolkit` 自带 DPC++（icx 2026.0）+ oneMKL；
    llama.cpp（`~/llama.cpp`，shallow clone）CPU 构建通过，

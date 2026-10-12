@@ -4,7 +4,7 @@
 #include "ggml-cpu.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
-#include "sampler.cpp"
+#include "../runner/sampler.cpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>

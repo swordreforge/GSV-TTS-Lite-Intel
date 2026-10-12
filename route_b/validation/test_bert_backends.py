@@ -1,6 +1,11 @@
 """End-to-end: use_bert=True 中文推理，对比 RoBERTa torch-XPU / OV-GPU / OV-NPU。"""
 import sys, os, time, logging
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+# 仓库根（route_b/ 下脚本需回退两级）
+_ROOT = os.path.dirname(os.path.dirname(_HERE)) if os.path.basename(os.path.dirname(_HERE)) == "route_b" else _HERE
+if _ROOT != _HERE:
+    sys.path.insert(0, _ROOT)
 logging.disable(logging.INFO)
 import numpy as np
 from gsv_tts import TTS

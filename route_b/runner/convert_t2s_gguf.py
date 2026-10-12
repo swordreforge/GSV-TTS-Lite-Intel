@@ -10,7 +10,12 @@ arch 名: gpt-sovits-t2s（自定义，llama.cpp 官方不识别；
 - 精度：保持 fp16（与管线一致）
 """
 import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+# 仓库根（route_b/ 下脚本需回退两级）
+_ROOT = os.path.dirname(os.path.dirname(_HERE)) if os.path.basename(os.path.dirname(_HERE)) == "route_b" else _HERE
+if _ROOT != _HERE:
+    sys.path.insert(0, _ROOT)
 sys.path.insert(0, "/home/swordreforge/llama.cpp/gguf-py")
 from pathlib import Path
 import torch

@@ -1,6 +1,11 @@
 """导出 SoVITS flow+dec 为 OV 静态 IR（F=772 精确 shape），GPU 验证数值+耗时。"""
 import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+# 仓库根（route_b/ 下脚本需回退两级）
+_ROOT = os.path.dirname(os.path.dirname(_HERE)) if os.path.basename(os.path.dirname(_HERE)) == "route_b" else _HERE
+if _ROOT != _HERE:
+    sys.path.insert(0, _ROOT)
 import torch, time, copy
 import numpy as np
 import openvino as ov
