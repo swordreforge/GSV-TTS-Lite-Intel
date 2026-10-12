@@ -346,6 +346,9 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
 - **终极仲裁**（中文输入）：runner greedy vs 纯 torch greedy 逐 token 一致
   （`torch_greedy_zh.py`；贪心双方都塌成 239，模型行为）。
   C++ 侧无辜实锤：随机采样的前缀/回声是模型+采样器行为，同条件 torch 一样有；
+  自指测试（prompt 文本生成 prompt 音频）：输出 393 token 含 0 个 prompt 子串（≥10），
+  同语言无泄露；音频互相关的多处“匹配”是同音色假阳性。真问题是口吃（29 处三连重复，
+  时长翻倍），上游采样器行为，靠随机 seed + 必要时 repetition_penalty 缓解。
   serving 侧 strip/随机 seed 是在上游行为之上做质量修正。
 - **专属模型陷阱**：gguf 必须全 2D 转置存储（runner 运行时转回），提交版 converter
   存 raw 从没产出过可用 gguf——唯一验证过的 00:05 文件是转置版。已修（转出逐字节一致），
