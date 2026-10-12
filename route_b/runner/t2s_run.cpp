@@ -399,6 +399,8 @@ static int run_job(int * ntoks_out) {
     for (int j : SUPP) if (j < 1024) lg0[j] = -INFINITY;
     auto pr0 = logits_to_probs(lg0.data(), 1024, prev.data(), (int)prev.size(), so);
     int t_cur = multinomial_exp(pr0, rng);
+    bool stream = getenv("RUNNER_STREAM") && atoi(getenv("RUNNER_STREAM"));
+    if (stream) printf("TOK %d\n", t_cur);
     int NSTEPS_ALL = 0;
     std::vector<int64_t> tref0, tnext;
     if (VALIDATE()) {
@@ -477,6 +479,7 @@ static int run_job(int * ntoks_out) {
         if (sup) for (int j : SUPP) got[j] = -INFINITY;
         auto pr = logits_to_probs(got.data(), VOCAB, prev.data(), (int)prev.size(), so);
         int tout = multinomial_exp(pr, rng);
+        if (stream) printf("TOK %d\n", tout);
         if (VALIDATE()) {
             int expect = (int)tnext[s];
             if (s < 3 || s % 50 == 0 || tout != expect)
