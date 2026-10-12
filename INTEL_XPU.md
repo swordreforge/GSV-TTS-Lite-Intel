@@ -333,6 +333,10 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   `POST /tts` 切分长文本串行合成。验收：短句 10s 真语音（rms 0.1)，第二请求 29s→7s。
 - **长文本**：cut_minlen 默认 30 + `GET /progress`（current/total）。
   1800 字：7 分钟出 11 分钟音频（段少静音垫料少；同文本上次 17.9 分钟系分段差异+采样方差）。
+- **prompt 泄漏根因=坏 y**：Hubert 提 y 是进程彩票（A 家族 uniq~94/sil0→干净；
+  B 家族 uniq~50/sil20%→漫游），同进程确定、跨进程开奖，warming/线程数都不是主因。
+  工程解：好 y 落盘（`~/.cache/gsv/prompt_y/`）+ `PROMPT_Y_FILE` 覆盖，
+  已验 0.9s 干脆 “こんにちは”（之前坏 y 出 9.7s 前缀垃圾）。新音频待自动优选。
 - **三语可用**：中文/英文短句经 API 出声正常（6s，rms 0.09，无塌陷）；
   内容级验证需人耳或 ASR（环境无 whisper，电平+时长只证明非静默非乱码）。
 - **按 token 流式**（`POST /tts/stream`，f32le 裸流）：runner `TOK` 行驱动，
