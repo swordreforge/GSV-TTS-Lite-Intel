@@ -169,11 +169,11 @@ int main() {
     ggml_tensor *text_emb = WS.text_emb, *audio_emb = WS.audio_emb;
     ggml_tensor *bert_w = WS.bert_w, *bert_b = WS.bert_b, *predict_w = WS.predict_w;
     float alpha_t = 0, alpha_a = 0;
-    { FILE * f = fopen((std::string(RDIR) + "text_alpha.bin").c_str(), "rb");
-      fread(&alpha_t, 4, 1, f); fclose(f); }
-    { FILE * f = fopen((std::string(RDIR) + "audio_alpha.bin").c_str(), "rb");
-      fread(&alpha_a, 4, 1, f); fclose(f); }
-    printf("alphas(F32): text=%.7f audio=%.7f\n", alpha_t, alpha_a);
+    { auto at = gguf_bytes(A + ".ar_text_pos_alpha", 1);
+      auto aa = gguf_bytes(A + ".ar_audio_pos_alpha", 1);
+      alpha_t = ggml_fp16_to_fp32(((ggml_fp16_t *)at)[0]);
+      alpha_a = ggml_fp16_to_fp32(((ggml_fp16_t *)aa)[0]); }
+    printf("alphas(gguf): text=%.7f audio=%.7f\n", alpha_t, alpha_a);
 
     std::vector<ggml_tensor *> kc(NL), vc(NL);
     for (int i = 0; i < NL; i++) {
@@ -226,7 +226,7 @@ int main() {
             pe[p * 512 + d * 2] = sinf(p * div);
             pe[p * 512 + d * 2 + 1] = cosf(p * div);
         }
-    {
+    if (VALIDATE()) {
         auto vpec = load_f32(EDIR, "pe_cache", (size_t)4000 * 512);
         float m = 0;
         for (int i = 0; i < 4000 * 512; i++) { float dd = fabsf(pe[i] * alpha_a - vpec[i]); if (dd > m) m = dd; }
