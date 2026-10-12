@@ -92,6 +92,16 @@ def wemb(y):
     return orig_emb_fw(y)
 t2s.ar_audio_embedding.forward = wemb
 
+# prefill 入口同轮捕获（prompt token 跨轮不稳定，必须同轮）
+psd = {}
+orig_psd = t2s.process_single_data
+def wpsd(x, y, bert):
+    xy, mk = orig_psd(x, y, bert)
+    psd.update(x=x.detach().cpu().clone(), y=y.detach().cpu().clone(),
+               bert=bert.detach().cpu().clone(),
+               xy=xy.detach().cpu().clone(), mk=mk.detach().cpu().clone())
+    return xy, mk
+t2s.process_single_data = wpsd
 tts.infer(**KW)
 N = len(dec_inputs)
 print(f"dec_steps={N}, sample_calls={len(sample_calls)}, x_len={box['x_len']}, EOS={t2s.EOS}", flush=True)
@@ -133,6 +143,11 @@ with torch.inference_mode():
     supp = [1 if (s + 1) < 10 else 0 for s in range(N)]
     sv("suppressed", np.array(supp, dtype=np.int64))
     sv("nsteps", np.array([N], dtype=np.int64))
+    sv("xlen_ylen", np.array([psd["x"].shape[1], psd["y"].shape[1]], dtype=np.int64))
+    sv("x_ids", psd["x"].numpy().astype(np.int64))
+    sv("bert", psd["bert"].numpy())
+    sv("xy_ref", psd["xy"].numpy())
+    sv("prompt_mask", psd["mk"].numpy().astype(np.uint8))
     # 交叉验证：emb 公式重算 xy；sample 输出 == emb token 序
     ok = True
     for s in range(N):

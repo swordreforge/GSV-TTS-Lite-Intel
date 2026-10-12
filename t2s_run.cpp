@@ -1,0 +1,421 @@
+// 路线 B runner：gguf 加载 + pe现场生成 + entry + prefill + decode闭环 + sampler（SYCL）。
+#include "ggml.h"
+#include "ggml-cpu.h"
+#include "ggml-backend.h"
+#include "ggml-alloc.h"
+#include "ggml-sycl.h"
+#include "gguf.h"
+#include "sampler.cpp"
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
+#include <vector>
+#include <string>
+#include <map>
+#include <chrono>
+
+static const int H = 16, HD = 32, DIM = 512, NL = 24, VOCAB = 1025;
+static const char * GGUF_PATH = "/home/swordreforge/.cache/gsv/gguf/t2s-s1v3-f16.gguf";
+static const char * RDIR = "/tmp/opencode/t2s_run/";
+static const char * CDIR = "/tmp/opencode/t2s_closed/";
+static const char * EDIR = "/tmp/opencode/t2s_emb/";
+static const int K = 512;
+static const char * ARCH = "gpt-sovits-t2s";
+static const int EOS_ID = 1024;
+static const int SUPP[3] = {280, 486, 1024};
+
+static std::vector<uint8_t> g_gguf_data;
+static std::map<std::string, std::pair<size_t, size_t>> g_map;
+
+static void gguf_load() {
+    FILE * f = fopen(GGUF_PATH, "rb");
+    if (!f) { printf("no gguf\n"); exit(1); }
+    fseek(f, 0, SEEK_END); size_t sz = ftell(f); fseek(f, 0, SEEK_SET);
+    g_gguf_data.resize(sz);
+    if (fread(g_gguf_data.data(), 1, sz, f) != sz) { printf("read short\n"); exit(1); }
+    fclose(f);
+    FILE * f2 = fopen(GGUF_PATH, "rb");
+    struct gguf_init_params p = { true, nullptr };
+    struct gguf_context * ctx = gguf_init_from_file_ptr(f2, p);
+    if (!ctx) { printf("gguf parse fail\n"); exit(1); }
+    size_t data_off = gguf_get_data_offset(ctx);
+    int64_t n = gguf_get_n_tensors(ctx);
+    for (int64_t i = 0; i < n; i++) {
+        const char * nm = gguf_get_tensor_name(ctx, i);
+        size_t off = gguf_get_tensor_offset(ctx, i);
+        const int64_t * ne = gguf_get_tensor_ne(ctx, i);
+        size_t nel = 1;
+        for (int d = 0; d < 4; d++) nel *= (size_t)ne[d];
+        g_map[nm] = { data_off + off, nel };
+    }
+    printf("gguf tensors: %lld\n", (long long)n);
+    fclose(f2);
+}
+
+static const uint8_t * gguf_bytes(const std::string & name, size_t expect_n) {
+    auto it = g_map.find(name);
+    if (it == g_map.end()) { printf("missing tensor %s\n", name.c_str()); exit(1); }
+    if (it->second.second != expect_n) { printf("ne mismatch %s: %zu vs %zu\n", name.c_str(), it->second.second, expect_n); exit(1); }
+    return g_gguf_data.data() + it->second.first;
+}
+
+static std::vector<float> load_f32(const std::string & dir, const std::string & name, size_t n) {
+    FILE * f = fopen((dir + name + ".bin").c_str(), "rb");
+    if (!f) { printf("missing %s%s\n", dir.c_str(), name.c_str()); exit(1); }
+    std::vector<float> v(n);
+    if (fread(v.data(), sizeof(float), n, f) != n) { printf("short %s\n", name.c_str()); exit(1); }
+    fclose(f);
+    return v;
+}
+static std::vector<int64_t> load_i64(const std::string & dir, const std::string & name, size_t n) {
+    FILE * f = fopen((dir + name + ".bin").c_str(), "rb");
+    if (!f) { printf("missing %s%s\n", dir.c_str(), name.c_str()); exit(1); }
+    std::vector<int64_t> v(n);
+    if (fread(v.data(), sizeof(int64_t), n, f) != n) { printf("short %s\n", name.c_str()); exit(1); }
+    fclose(f);
+    return v;
+}
+static std::vector<uint8_t> load_u8(const std::string & dir, const std::string & name, size_t n) {
+    FILE * f = fopen((dir + name + ".bin").c_str(), "rb");
+    if (!f) { printf("missing %s%s\n", dir.c_str(), name.c_str()); exit(1); }
+    std::vector<uint8_t> v(n);
+    if (fread(v.data(), 1, n, f) != n) { printf("short %s\n", name.c_str()); exit(1); }
+    fclose(f);
+    return v;
+}
+
+int main() {
+    setbuf(stdout, nullptr);
+    auto tick = []() { return std::chrono::steady_clock::now(); };
+    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+
+    // ---- 输入（host） ----
+    auto xyl = load_i64(CDIR, "xlen_ylen", 2);
+    int X = (int)xyl[0], Y = (int)xyl[1], L = X + Y;
+    auto vx = load_i64(CDIR, "x_ids", X);
+    auto vy = load_i64(CDIR, "y", Y);
+    FILE * fb = fopen((std::string(CDIR) + "bert.bin").c_str(), "rb");
+    std::vector<float> vbert((size_t)X * 1024);
+    if (fread(vbert.data(), 4, vbert.size(), fb) != vbert.size()) { printf("bert short\n"); return 1; }
+    fclose(fb);
+
+    gguf_load();
+    std::string A = ARCH;
+
+    struct ggml_init_params params = { 1024ULL * 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+
+    // ---- 建全部 tensor（alloc 之前） ----
+    std::vector<std::pair<ggml_tensor *, std::vector<uint8_t>>> g_keep16;
+    std::vector<std::pair<ggml_tensor *, std::vector<float>>> g_keep32;
+    // gguf 文件字节 = torch 原始行序（writer 内部又转了一次，和 converter 的 transpose 抵消）。
+    // 声明沿用已验证约定：2D 用 [in,out] 错位声明，emb 用 [D,V]。
+    // gguf 2D 文件字节 = torch.T 的 C-order；转回 torch 行序后按已验证声明喂。
+    // emb 例外：host 侧已按列序 strided 取行，保持文件原样。
+    auto T16 = [&](const std::string & gname, int64_t n0, int64_t n1, bool untranspose = false) {
+        size_t n = (size_t)n0 * n1;
+        const uint8_t * src = gguf_bytes(gname, n);
+        ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n0, n1);
+        std::vector<uint8_t> raw(src, src + n * sizeof(ggml_fp16_t));
+        if (untranspose) {
+            std::vector<uint8_t> tu(n * sizeof(ggml_fp16_t));
+            auto * s16 = (ggml_fp16_t *)raw.data();
+            auto * d16 = (ggml_fp16_t *)tu.data();
+            for (int64_t i = 0; i < n0; i++)
+                for (int64_t o = 0; o < n1; o++) d16[o * n0 + i] = s16[i * n1 + o];
+            raw.swap(tu);
+        }
+        g_keep16.emplace_back(t, std::move(raw));
+        return t;
+    };
+    auto T32 = [&](const std::string & gname, int64_t n0) {
+        size_t n = (size_t)n0;
+        const uint8_t * src = gguf_bytes(gname, n);
+        auto * h = (const ggml_fp16_t *)src;
+        std::vector<float> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = ggml_fp16_to_fp32(h[i]);
+        ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n0);
+        g_keep32.emplace_back(t, std::move(v));
+        return t;
+    };
+
+    ggml_tensor * text_emb = T16(A + ".ar_text_emb.weight", 512, 732);
+    ggml_tensor * audio_emb = T16(A + ".ar_audio_emb.weight", 512, VOCAB);
+    ggml_tensor * bert_w = T16(A + ".bert_proj.weight", 1024, 512, true);
+    ggml_tensor * bert_b = T32(A + ".bert_proj.bias", 512);
+    ggml_tensor * predict_w = T16(A + ".predict.weight", 512, VOCAB, true);
+    struct Lyr { ggml_tensor *qw, *qb, *ow, *ob, *n1w, *n1b, *m1w, *m1b, *m2w, *m2b, *n2w, *n2b; };
+    std::vector<Lyr> ly(NL);
+    char gb[128];
+    for (int i = 0; i < NL; i++) {
+        snprintf(gb, 128, "%s.blk.%d.qkv.weight", A.c_str(), i); ly[i].qw = T16(gb, DIM, 3 * DIM, true);
+        snprintf(gb, 128, "%s.blk.%d.qkv.bias", A.c_str(), i); ly[i].qb = T32(gb, 3 * DIM);
+        snprintf(gb, 128, "%s.blk.%d.out.weight", A.c_str(), i); ly[i].ow = T16(gb, DIM, DIM, true);
+        snprintf(gb, 128, "%s.blk.%d.out.bias", A.c_str(), i); ly[i].ob = T32(gb, DIM);
+        snprintf(gb, 128, "%s.blk.%d.n1.weight", A.c_str(), i); ly[i].n1w = T32(gb, DIM);
+        snprintf(gb, 128, "%s.blk.%d.n1.bias", A.c_str(), i); ly[i].n1b = T32(gb, DIM);
+        snprintf(gb, 128, "%s.blk.%d.mlp1.weight", A.c_str(), i); ly[i].m1w = T16(gb, DIM, 4 * DIM, true);
+        snprintf(gb, 128, "%s.blk.%d.mlp1.bias", A.c_str(), i); ly[i].m1b = T32(gb, 4 * DIM);
+        snprintf(gb, 128, "%s.blk.%d.mlp2.weight", A.c_str(), i); ly[i].m2w = T16(gb, 4 * DIM, DIM, true);
+        snprintf(gb, 128, "%s.blk.%d.mlp2.bias", A.c_str(), i); ly[i].m2b = T32(gb, DIM);
+        snprintf(gb, 128, "%s.blk.%d.n2.weight", A.c_str(), i); ly[i].n2w = T32(gb, DIM);
+        snprintf(gb, 128, "%s.blk.%d.n2.bias", A.c_str(), i); ly[i].n2b = T32(gb, DIM);
+    }
+    float alpha_t = 0, alpha_a = 0;
+    { FILE * f = fopen((std::string(RDIR) + "text_alpha.bin").c_str(), "rb");
+      fread(&alpha_t, 4, 1, f); fclose(f); }
+    { FILE * f = fopen((std::string(RDIR) + "audio_alpha.bin").c_str(), "rb");
+      fread(&alpha_a, 4, 1, f); fclose(f); }
+    printf("alphas(F32): text=%.7f audio=%.7f\n", alpha_t, alpha_a);
+
+    std::vector<ggml_tensor *> kc(NL), vc(NL);
+    for (int i = 0; i < NL; i++) {
+        kc[i] = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, HD, K, H);
+        vc[i] = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, HD, K, H);
+    }
+    ggml_tensor * xpf = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, DIM, L);   // prefill 输入
+    ggml_tensor * pbias = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, L, L, H); // prefill bias
+    ggml_tensor * x1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, DIM, 1);    // decode 输入
+    ggml_tensor * bias3 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, H);
+    const float scale = 1.0f / sqrtf((float)HD);
+
+    ggml_backend_t backend = ggml_backend_sycl_init(0);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    for (auto & kv : g_keep16) ggml_backend_tensor_set(kv.first, kv.second.data(), 0, kv.second.size());
+    for (auto & kv : g_keep32) ggml_backend_tensor_set(kv.first, kv.second.data(), 0, kv.second.size() * sizeof(float));
+    { std::vector<uint8_t> z((size_t)HD * K * H * sizeof(ggml_fp16_t), 0);
+      for (int i = 0; i < NL; i++) {
+          ggml_backend_tensor_set(kc[i], z.data(), 0, z.size());
+          ggml_backend_tensor_set(vc[i], z.data(), 0, z.size());
+      } }
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_sycl_buffer_type(0));
+
+    // ---- pe 现场生成 + 校验 ----
+    std::vector<float> pe(4000 * 512);
+    for (int p = 0; p < 4000; p++)
+        for (int d = 0; d < 256; d++) {
+            float div = expf((float)(d * 2) * (float)(-(log(10000.0) / 512.0)));
+            pe[p * 512 + d * 2] = sinf(p * div);
+            pe[p * 512 + d * 2 + 1] = cosf(p * div);
+        }
+    {
+        auto vpec = load_f32(EDIR, "pe_cache", (size_t)4000 * 512);
+        float m = 0;
+        for (int i = 0; i < 4000 * 512; i++) { float dd = fabsf(pe[i] * alpha_a - vpec[i]); if (dd > m) m = dd; }
+        printf("pe regen vs dump: maxdiff=%.7f\n", m);
+    }
+
+    // ---- entry（host） ----
+    std::vector<float> emb_t(512 * 732), emb_a(512 * VOCAB), bwh(1024 * 512), bbh(512);
+    { std::vector<uint8_t> r0(512 * 732 * 2), r1(512 * VOCAB * 2), r2(1024 * 512 * 2);
+      ggml_backend_tensor_get(text_emb, r0.data(), 0, r0.size());
+      ggml_backend_tensor_get(audio_emb, r1.data(), 0, r1.size());
+      ggml_backend_tensor_get(bert_w, r2.data(), 0, r2.size());
+      ggml_backend_tensor_get(bert_b, bbh.data(), 0, bbh.size() * sizeof(float));
+      auto * h0 = (ggml_fp16_t *)r0.data(), * h1 = (ggml_fp16_t *)r1.data(), * h2 = (ggml_fp16_t *)r2.data();
+      for (int v = 0; v < 732; v++)
+          for (int d = 0; d < 512; d++) emb_t[(size_t)v * 512 + d] = ggml_fp16_to_fp32(h0[(size_t)d * 732 + v]);
+      for (int v = 0; v < VOCAB; v++)
+          for (int d = 0; d < 512; d++) emb_a[(size_t)v * 512 + d] = ggml_fp16_to_fp32(h1[(size_t)d * VOCAB + v]);
+      for (size_t i = 0; i < bwh.size(); i++) bwh[i] = ggml_fp16_to_fp32(h2[i]); }
+    std::vector<float> xy((size_t)L * 512);
+    for (int xi = 0; xi < X; xi++) {
+        int tid = (int)vx[xi];
+        for (int d = 0; d < 512; d++) {
+            float acc = bbh[d];
+            for (int i = 0; i < 1024; i++) acc += vbert[(size_t)xi * 1024 + i] * bwh[(size_t)i * 512 + d];
+            xy[(size_t)xi * 512 + d] = emb_t[(size_t)tid * 512 + d] + acc + alpha_t * pe[(size_t)xi * 512 + d];
+        }
+    }
+    for (int yi = 0; yi < Y; yi++) {
+        int tid = (int)vy[yi];
+        for (int d = 0; d < 512; d++)
+            xy[(size_t)(X + yi) * 512 + d] = emb_a[(size_t)tid * 512 + d] + alpha_a * pe[(size_t)yi * 512 + d];
+    }
+    {
+        auto vxy = load_f32(CDIR, "xy_ref", (size_t)L * 512);
+        float m = 0;
+        for (size_t i = 0; i < xy.size(); i++) { float dd = fabsf(xy[i] - vxy[i]); if (dd > m) m = dd; }
+        printf("entry xy maxdiff=%.7f\n", m);
+    }
+    // prompt bias [L,L,16]（全头同 pattern）
+    auto vpm = load_u8(CDIR, "prompt_mask", (size_t)H * L * L);
+    {
+        int bad = 0;
+        for (int r = 0; r < L; r++) for (int c = 0; c < L; c++) {
+            uint8_t e = (r < X) ? (c < X ? 1 : 0) : ((c < X || c - X <= r - X) ? 1 : 0);
+            if (vpm[r * L + c] != e) bad++;
+        }
+        printf("prompt mask formula check: bad=%d\n", bad);
+    }
+    // scores dst[m=key_t,n=query_t,h]；torch mask[query,key] -> bias[m,n] = mask[n,m]
+    std::vector<float> pb((size_t)L * L * H);
+    for (int h = 0; h < H; h++)
+        for (int m = 0; m < L; m++)
+            for (int n = 0; n < L; n++)
+                // pbias 张量布局 [L,L,H] F 语义：flat = m + L*n + L*L*h；vpm (h,q,k)：取 q=n,k=m
+                pb[((size_t)m + (size_t)L * n) + (size_t)L * L * h] = vpm[((size_t)h * L + n) * L + m] ? 0.0f : -1e30f;
+    ggml_backend_tensor_set(xpf, xy.data(), 0, xy.size() * sizeof(float));
+    ggml_backend_tensor_set(pbias, pb.data(), 0, pb.size() * sizeof(float));
+
+    // ================= PREFILL =================
+    ggml_tensor * cur = xpf;
+    std::vector<ggml_tensor *> pcpys;
+    for (int i = 0; i < NL; i++) {
+        ggml_tensor * qkv = ggml_add(ctx, ggml_mul_mat(ctx, ly[i].qw, cur), ly[i].qb);
+        const size_t qts = ggml_type_size(qkv->type);
+        // q/k/v [32,L,16]：element (d,l,h) at l*1536*qts + h*32*qts + d*qts
+        ggml_tensor * q = ggml_view_3d(ctx, qkv, HD, L, H, (size_t)1536 * qts, (size_t)HD * qts, 0);
+        ggml_tensor * k = ggml_view_3d(ctx, qkv, HD, L, H, (size_t)1536 * qts, (size_t)HD * qts, (size_t)DIM * qts);
+        ggml_tensor * v = ggml_view_3d(ctx, qkv, HD, L, H, (size_t)1536 * qts, (size_t)HD * qts, (size_t)2 * DIM * qts);
+        // 写 cache [0,L)：整块 cpy（strides 兼容：src nb=[qts,1536qts,32qts]，dst [2,64,32768]）
+        ggml_tensor * dstk = ggml_view_3d(ctx, kc[i], HD, L, H, (size_t)HD * sizeof(ggml_fp16_t),
+                                          (size_t)HD * K * sizeof(ggml_fp16_t), 0);
+        ggml_tensor * dstv = ggml_view_3d(ctx, vc[i], HD, L, H, (size_t)HD * sizeof(ggml_fp16_t),
+                                          (size_t)HD * K * sizeof(ggml_fp16_t), 0);
+        // k/v 切分是跨步视图（nb1=1536），先 cont 再 cpy（跨步源 cpy 不可信）
+        pcpys.push_back(ggml_cpy(ctx, ggml_cont(ctx, k), dstk));
+        pcpys.push_back(ggml_cpy(ctx, ggml_cont(ctx, v), dstv));
+        ggml_tensor * sc = ggml_scale(ctx, ggml_mul_mat(ctx, k, q), scale);
+        ggml_tensor * p = ggml_soft_max(ctx, ggml_add(ctx, sc, pbias));
+        // O[d,l,h] = sum_t V[d,t,h] P[t,l,h]：Vt=[L,32,16]
+        ggml_tensor * vT = ggml_cont(ctx, ggml_transpose(ctx, v));
+        ggml_tensor * ob = ggml_mul_mat(ctx, vT, p);
+        ggml_tensor * o = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, ob, 0, 2, 1, 3)), DIM, L);
+        ggml_tensor * proj = ggml_add(ctx, ggml_mul_mat(ctx, ly[i].ow, o), ly[i].ob);
+        ggml_tensor * r1 = ggml_add(ctx, cur, proj);
+        ggml_tensor * n1 = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, r1, 1e-5f), ly[i].n1w), ly[i].n1b);
+        ggml_tensor * h1 = ggml_add(ctx, ggml_mul_mat(ctx, ly[i].m1w, n1), ly[i].m1b);
+        ggml_tensor * h3 = ggml_add(ctx, ggml_mul_mat(ctx, ly[i].m2w, ggml_relu(ctx, h1)), ly[i].m2b);
+        cur = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, ggml_add(ctx, n1, h3), 1e-5f), ly[i].n2w), ly[i].n2b);
+    }
+    // predict last 列
+    ggml_tensor * lastcol = ggml_view_2d(ctx, cur, DIM, 1, DIM * sizeof(float), (size_t)(L - 1) * DIM * sizeof(float));
+    ggml_tensor * plogits = ggml_mul_mat(ctx, predict_w, lastcol);
+    ggml_cgraph * gfp = ggml_new_graph_custom(ctx, 32768, false);
+    for (auto c : pcpys) ggml_build_forward_expand(gfp, c);
+    ggml_build_forward_expand(gfp, plogits);
+    printf("prefill graph n_nodes=%d\n", ggml_graph_n_nodes(gfp));
+    ggml_gallocr_alloc_graph(galloc, gfp);
+    auto t0 = tick();
+    ggml_backend_graph_compute(backend, gfp);
+    ggml_backend_synchronize(backend);
+    printf("prefill compute %.0fms\n", ms(t0, tick()));
+    std::vector<float> gotp(VOCAB);
+    ggml_backend_tensor_get(plogits, gotp.data(), 0, gotp.size() * sizeof(float));
+    {
+        auto vpr = load_f32("/tmp/opencode/", "torch_pflogits", VOCAB);
+        float m = 0;
+        for (int j = 0; j < VOCAB; j++) { float dd = fabsf(gotp[j] - vpr[j]); if (dd > m) m = dd; }
+        printf("prefill logits maxdiff=%.6f\n", m);
+    }
+
+    // prefill cache 校验（vs closed dump post-prefill）
+    {
+        auto k0 = load_f32(CDIR, "kc0", (size_t)HD * K * H);
+        std::vector<uint8_t> raw((size_t)HD * K * H * 2);
+        ggml_backend_tensor_get(kc[0], raw.data(), 0, raw.size());
+        auto * h = (ggml_fp16_t *)raw.data();
+        float m = 0;
+        for (int hh = 0; hh < H; hh++)
+            for (int t = 0; t < K; t++)
+                for (int d = 0; d < HD; d++) {
+                    float a = ggml_fp16_to_fp32(h[d + HD * t + HD * K * hh]);
+                    float b = k0[(size_t)hh * K * HD + t * HD + d];
+                    float dd = fabsf(a - b);
+                    if (dd > m) m = dd;
+                }
+        printf("prefill kc0 maxdiff=%.6f\n", m);
+    }
+
+    // first sample（V=1024，恒 suppress）
+    std::vector<int> prev;
+    for (auto t : vy) prev.push_back((int)t);
+    SampleOpt so;
+    so.top_k = 1; so.top_p = 1.0f; so.temp = 1.0f; so.rep = 1.35f;
+    std::mt19937 rng(1234);
+    std::vector<float> lg0(gotp.begin(), gotp.begin() + 1024);
+    for (int j : SUPP) if (j < 1024) lg0[j] = -INFINITY;
+    auto pr0 = logits_to_probs(lg0.data(), 1024, prev.data(), (int)prev.size(), so);
+    int t_cur = multinomial_exp(pr0, rng);
+    auto tref0 = load_i64(CDIR, "tokens", 761);
+    printf("t0=%d ref=%lld %s\n", t_cur, (long long)tref0[0], t_cur == tref0[0] ? "OK" : "MISMATCH");
+
+    // ================= DECODE LOOP =================
+    auto tnext = load_i64(CDIR, "tokens_next", 761);
+    int ln = L, nsteps = 0, NSTEPS = 248;
+    if (ln + NSTEPS > K) NSTEPS = K - ln - 1;
+    bool allok = (t_cur == tref0[0]);
+    prev.push_back(t_cur);
+    for (int s = 0; s < NSTEPS; s++) {
+        // entry：xy = emb[t_cur]*1 + alpha_a*pe[ln - X]
+        int pi = ln - X;
+        std::vector<float> xy1(DIM);
+        for (int d = 0; d < DIM; d++) xy1[d] = emb_a[(size_t)t_cur * 512 + d] + alpha_a * pe[(size_t)pi * 512 + d];
+        ggml_backend_tensor_set(x1, xy1.data(), 0, xy1.size() * sizeof(float));
+        std::vector<float> b3((size_t)K * H);
+        for (int h = 0; h < H; h++)
+            for (int t = 0; t < K; t++) b3[h * K + t] = (t <= ln) ? 0.0f : -1e30f;
+        ggml_backend_tensor_set(bias3, b3.data(), 0, b3.size() * sizeof(float));
+
+        ggml_tensor * c2 = x1;
+        std::vector<ggml_tensor *> cpys;
+        cpys.reserve(2 * NL * H);
+        const size_t cts = sizeof(ggml_fp16_t);
+        for (int i = 0; i < NL; i++) {
+            ggml_tensor * qkv = ggml_add(ctx, ggml_mul_mat(ctx, ly[i].qw, c2), ly[i].qb);
+            const size_t qts = ggml_type_size(qkv->type);
+            ggml_tensor * qb2 = ggml_reshape_3d(ctx, ggml_view_1d(ctx, qkv, DIM, 0), HD, 1, H);
+            ggml_tensor * k = ggml_reshape_3d(ctx, ggml_view_1d(ctx, qkv, DIM, DIM * qts), HD, H, 1);
+            ggml_tensor * vv = ggml_reshape_3d(ctx, ggml_view_1d(ctx, qkv, DIM, 2 * DIM * qts), HD, H, 1);
+            for (int hw = 0; hw < H; hw++) {
+                ggml_tensor * khw = ggml_view_2d(ctx, k, HD, 1, HD * qts, (size_t)hw * HD * qts);
+                ggml_tensor * dstk = ggml_view_2d(ctx, kc[i], HD, 1, HD * cts,
+                                                 ((size_t)hw * HD * K + (size_t)ln * HD) * cts);
+                cpys.push_back(ggml_cpy(ctx, khw, dstk));
+                ggml_tensor * vhw = ggml_view_2d(ctx, vv, HD, 1, HD * qts, (size_t)hw * HD * qts);
+                ggml_tensor * dstv = ggml_view_2d(ctx, vc[i], HD, 1, HD * cts,
+                                                 ((size_t)hw * HD * K + (size_t)ln * HD) * cts);
+                cpys.push_back(ggml_cpy(ctx, vhw, dstv));
+            }
+            ggml_tensor * scb = ggml_scale(ctx, ggml_mul_mat(ctx, kc[i], qb2), scale);
+            ggml_tensor * pbb = ggml_soft_max(ctx, ggml_add(ctx, scb, bias3));
+            ggml_tensor * vtb = ggml_cont(ctx, ggml_transpose(ctx, vc[i]));
+            ggml_tensor * ob = ggml_mul_mat(ctx, vtb, pbb);
+            ggml_tensor * o = ggml_reshape_2d(ctx, ob, DIM, 1);
+            ggml_tensor * proj = ggml_add(ctx, ggml_mul_mat(ctx, ly[i].ow, o), ly[i].ob);
+            ggml_tensor * r1 = ggml_add(ctx, c2, proj);
+            ggml_tensor * n1 = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, r1, 1e-5f), ly[i].n1w), ly[i].n1b);
+            ggml_tensor * h1 = ggml_add(ctx, ggml_mul_mat(ctx, ly[i].m1w, n1), ly[i].m1b);
+            ggml_tensor * h3 = ggml_add(ctx, ggml_mul_mat(ctx, ly[i].m2w, ggml_relu(ctx, h1)), ly[i].m2b);
+            c2 = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, ggml_add(ctx, n1, h3), 1e-5f), ly[i].n2w), ly[i].n2b);
+        }
+        ggml_tensor * logits = ggml_mul_mat(ctx, predict_w, c2);
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16384, false);
+        for (auto c : cpys) ggml_build_forward_expand(gf, c);
+        ggml_build_forward_expand(gf, logits);
+        ggml_gallocr_alloc_graph(galloc, gf);
+        auto ts0 = tick();
+        ggml_backend_graph_compute(backend, gf);
+        ggml_backend_synchronize(backend);
+        double dms = ms(ts0, tick());
+        std::vector<float> got(VOCAB);
+        ggml_backend_tensor_get(logits, got.data(), 0, got.size() * sizeof(float));
+        bool sup = (s + 1) < 10;
+        if (sup) for (int j : SUPP) got[j] = -INFINITY;
+        auto pr = logits_to_probs(got.data(), VOCAB, prev.data(), (int)prev.size(), so);
+        int tout = multinomial_exp(pr, rng);
+        int expect = (int)tnext[s];
+        if (s < 3 || s % 50 == 0 || tout != expect)
+            printf("  step %d tok=%d expect=%d %s time=%.1fms\n", s, tout, expect, tout == expect ? "OK" : "MISMATCH", dms);
+        if (tout != expect) { allok = false; break; }
+        prev.push_back(tout);
+        t_cur = tout;
+        ln++;
+        nsteps++;
+        if ((s + 1) % 5 == 0 && tout == EOS_ID) break;
+    }
+    printf(allok ? "RUNNER ALL OK steps=%d\n" : "RUNNER DIVERGED\n", nsteps);
+    ggml_free(ctx);
+    return allok ? 0 : 1;
+}
