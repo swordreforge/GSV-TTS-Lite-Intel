@@ -42,6 +42,15 @@ EOS = 1024
 SR = 32000
 
 
+def _maybe_override_prompt(prompt):
+    """PROMPT_Y_FILE 有值则用盘上验过的好 y（prompt 抽签波动大，好 y 落盘复用）。"""
+    _pyf = os.environ.get("PROMPT_Y_FILE")
+    if _pyf and os.path.exists(_pyf):
+        prompt = torch.from_numpy(np.fromfile(_pyf, np.int64).reshape(1, -1))
+        print(f"prompt y overridden from {_pyf}", flush=True)
+    return prompt
+
+
 def strip_prompt_echo(sampled, prompt, maxk=12, mink=3):
     """去头部 prompt 回声：sampled 头部若为 prompt 尾的续写则剥掉（只剥一次）。
     sampled=去t0 EOS截断后；prompt=y 的 numpy。serving 质量修正，parity 工具不用。"""
@@ -211,6 +220,7 @@ def _synth(req: TTSReq) -> str:
     svx = sovits_m.vq_model.eval()
     gpt_m, prompt, phones1, bert1 = tts._prepare_gpt_resources(
         str(tts.default_gpt_path), req.prompt_audio, req.prompt_text, req.prompt_language)
+    prompt = _maybe_override_prompt(prompt)
 
     print(f"tts lang={req.language} prompt_lang={req.prompt_language} text={req.text[:20]!r}", flush=True)
     cuts = cut_text(req.text, req.cut_minlen)
@@ -285,6 +295,7 @@ def _synth_stream(req: StreamReq):
     overlap_samples = req.overlap_len * svx.samples_per_frame
     gpt_m, prompt, phones1, bert1 = tts._prepare_gpt_resources(
         str(tts.default_gpt_path), req.prompt_audio, req.prompt_text, req.prompt_language)
+    prompt = _maybe_override_prompt(prompt)
     print(f"tts lang={req.language} prompt_lang={req.prompt_language} text={req.text[:20]!r}", flush=True)
     cuts = cut_text(req.text, req.cut_minlen)
     if not cuts:

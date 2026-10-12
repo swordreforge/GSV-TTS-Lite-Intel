@@ -42,12 +42,12 @@ def forced(logits, pre_tokens, **kw):
         OUT.write(pr.astype(np.float32).tobytes())
     want = int(TRAJ[i]) if i < len(TRAJ) else int(np.argmax(pr))
     rec["step"] += 1
-    return torch.tensor([[want]]), probs
+    return torch.tensor([[want]], device=logits.device), probs
 
 
 TM.sample = forced
 
-tts = TTS(device="cpu", dtype="float32")
+tts = TTS(device=os.environ.get("FORCE_DEV", "cpu"), dtype="float32")
 tts.load_gpt_model()
 tts.load_sovits_model()
 tts.init_language_module("ja")
@@ -56,8 +56,10 @@ phones2, _, bert2, _ = _gpb("こんにちは。", tts.tts_config, "ja")
 gpt_m, prompt, phones1, bert1 = tts._prepare_gpt_resources(
     str(tts.default_gpt_path), "examples/AnAn.ogg",
     "ちが……ちがう。レイア、貴様は間違っている。", "ja")
-x = torch.LongTensor(phones1 + phones2).unsqueeze(0)
-bert = torch.cat([bert1, bert2]).unsqueeze(0)
+dev = os.environ.get("FORCE_DEV", "cpu")
+x = torch.LongTensor(phones1 + phones2).unsqueeze(0).to(dev)
+bert = torch.cat([bert1, bert2]).unsqueeze(0).to(dev)
+prompt = prompt.to(dev)
 with torch.inference_mode():
     out = t2s.infer(x, prompt, bert, top_k=15, top_p=1.0, temperature=1.0,
                     repetition_penalty=1.35)

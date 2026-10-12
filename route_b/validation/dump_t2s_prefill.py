@@ -7,6 +7,7 @@ _ROOT = os.path.dirname(os.path.dirname(_HERE)) if os.path.basename(os.path.dirn
 if _ROOT != _HERE:
     sys.path.insert(0, _ROOT)
 from pathlib import Path
+import os
 import torch
 import numpy as np
 from gsv_tts import TTS
@@ -27,10 +28,10 @@ def _eager_sdpa(q, k, v, attn_mask=None, scale=None, **kw):
     return (torch.softmax(s, dim=-1) @ v.float()).to(q.dtype)
 _F.scaled_dot_product_attention = _eager_sdpa
 
-OUT = Path("/tmp/opencode/t2s_prefill")
+OUT = Path(os.environ.get("DUMP_OUT", "/tmp/opencode/t2s_prefill"))
 OUT.mkdir(parents=True, exist_ok=True)
 
-tts = TTS(device="cpu", dtype="float32")
+tts = TTS(device=os.environ.get("DUMP_DEV", "cpu"), dtype="float32")
 tts.load_gpt_model(); tts.load_sovits_model(); tts.init_language_module("ja")
 t2s = list(tts.gpt_models.values())[0].t2s_model.eval()
 
