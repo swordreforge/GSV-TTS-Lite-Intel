@@ -351,6 +351,10 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   非系统性计算 bug（suppression/切片/EOS/精度逐项对过，均一致）。
   fp16 曾被怀疑：纯 torch fp16 权重跑退化，但 ckpt 本就全 fp16 且 torch 照样 cast 跑，
   对照实为 RNG 运气；runner 已转 fp32 计算，贪心仍 exact。
+- **干净路径也一致**：runner teacher-forcing 沿 torch 干净轨迹，23/23 top-15 全同；
+  此后自由发散（RNG 本分）。C++ 无系统性 bug：贪心精确×2、TV 1e-6×168 步、t0×2、
+  sampler/切片/EOS/suppression 逐行对过。长度率差异是采样流运气+小样本，
+  要服气得跑 20v20；工程上靠 best-of-N/seed 试听 + ASR 门解决质量。
   自指测试（prompt 文本生成 prompt 音频）：输出 393 token 含 0 个 prompt 子串（≥10），
   同语言无泄露；音频互相关的多处“匹配”是同音色假阳性。真问题是口吃（29 处三连重复，
   时长翻倍），上游采样器行为，靠随机 seed + 必要时 repetition_penalty 缓解。
