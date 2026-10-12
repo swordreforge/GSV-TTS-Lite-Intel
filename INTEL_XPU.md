@@ -328,6 +328,10 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   torch 同 pad 输入是 exact（4.6e-5）——OV shape 相关误编译，
   bucket 路线放弃。enc_p 留 torch CPU（140ms 不值得搬）。
   **torch XPU 是答案**：SoVITS 全量 662ms vs CPU 3181ms（4.8x），
-  maxdiff 1.4e-5。XPU 端到端（fp32）：3.2s 出 3.8s 音频，RTF 0.86。相关脚本：`probe_sovits*.py`、
+  maxdiff 1.4e-5。XPU 端到端 fp32：3.2s 出 3.8s 音频，RTF 0.86。
+- **fp16 证伪（单流）**：XPU fp16 端到端 RTF 1.34，反比 fp32（0.86）慢；
+  GPT 46 tok/s vs fp32 73 tok/s，SoVITS fp16 直接 mixed-dtype 报错。
+  XPU math 后端 fp16 核慢（之前 RTF 0.5 是 batched 吞吐）。单流延迟
+  按 fp32 走，fp16 不碰。相关脚本：`probe_sovits*.py`、
   `export_sovits_*.py`（参考）、`dump_sovits_in.py`、`run_sovits_xpu.py`。
   `TextEncoder.infer` 加了可选 `y_mask/text_mask` 参数（向后兼容）。
