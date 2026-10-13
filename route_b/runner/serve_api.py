@@ -374,6 +374,11 @@ def _synth(req: TTSReq) -> str:
             print(f"chunk {i}: empty generation (immediate EOS), seed={seed}", flush=True)
             return np.zeros(0, dtype=np.float32), norm_txt
         print(f"chunk {i}: codes={len(seq)} xlen={x.shape[1]} ylen={prompt.shape[1]}", flush=True)
+        try:
+            print(f"chunk {i}: xpu mem alloc={torch.xpu.memory_allocated()/2**20:.0f}MB "
+                  f"reserved={torch.xpu.memory_reserved()/2**20:.0f}MB", flush=True)
+        except Exception as e:
+            print(f"chunk {i}: xpu mem query failed ({e})", flush=True)
         if len(seq) > 600:
             # runner 失控（无 EOS 狂奔）：500+ codes 的 SoVITS 解码是自杀行为，直接拒掉走重试
             print(f"chunk {i}: runaway generation ({len(seq)} codes), seed={seed}, refusing", flush=True)
