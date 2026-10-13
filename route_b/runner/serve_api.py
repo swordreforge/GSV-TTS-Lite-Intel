@@ -33,7 +33,7 @@ def _eager_sdpa(q, k, v, attn_mask=None, scale=None, **kw):
     return (torch.softmax(s, dim=-1) @ v.float()).to(q.dtype)
 _F.scaled_dot_product_attention = _eager_sdpa
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, File, Form, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -744,6 +744,85 @@ def tts_endpoint(req: TTSReq):
         _prog = {"state": "idle", "current": 0, "total": 0}
         raise HTTPException(500, f"synth failed: {e}")
     return FileResponse(path, media_type="audio/wav", filename=os.path.basename(path))
+
+
+@app.post("/vc")
+async def vc_endpoint(file: UploadFile | None = File(None),
+                      src_audio_path: str | None = Form(None),
+                      spk: str = Form("examples/laffey.mp3"),
+                      prompt_text: str = Form(""),
+                      prompt_language: str = Form("auto"),
+                      noise_scale: float = Form(0.5),
+                      sovits_model: str | None = Form(None)):
+    """变声：源音频内容 + 目标音色。file（上传）与 src_audio_path（服务端路径/URL）二选一；
+    prompt_text 缺省时自动 ASR 转写源音频。"""
+    import soundfile as sf
+    suffix = ".wav"
+    if file is not None:
+        data = await file.read()
+        if not data:
+            raise HTTPException(400, "empty upload")
+        suffix = os.path.splitext(file.filename or "")[1] or ".wav"
+        src = os.path.join(tempfile.gettempdir(), f"vc_src_{int(time.time()*1000)}{suffix}")
+        with open(src, "wb") as f:
+            f.write(data)
+    elif src_audio_path:
+        if src_audio_path.startswith(("http://", "https://")):
+            import urllib.request as _url
+            src = os.path.join(tempfile.gettempdir(), f"vc_url_{int(time.time()*1000)}.wav")
+            try:
+                _url.urlretrieve(src_audio_path, src)
+            except Exception as e:
+                raise HTTPException(400, f"download failed: {e}")
+        else:
+            if not os.path.exists(src_audio_path):
+                raise HTTPException(400, f"file not found: {src_audio_path}")
+            src = src_audio_path
+    else:
+        raise HTTPException(400, "file or src_audio_path required")
+
+    tts, tts_x = _get_tts()
+    tts.init_language_module("ja", "zh", "en")
+    sv_path = sovits_model or str(tts.default_sovits_path)
+    sov_cpu, _ = tts._prepare_sovits_resources(sv_path, spk)
+    sovits_m, ge = tts_x._prepare_sovits_resources(sv_path, spk)
+    svx = sovits_m.vq_model.eval()
+    if tts.cnhubert_model is None:
+        from gsv_tts.GPT_SoVITS.Featurizer import CNHubert
+        tts.cnhubert_model = CNHubert(tts.cnhubert_path, tts.tts_config)
+    heard_lang = None
+    if not prompt_text or not prompt_text.strip():
+        try:
+            m = _get_asr()
+            a0, sr0 = sf.read(src)
+            if getattr(a0, "ndim", 1) > 1:
+                a0 = a0.mean(axis=-1)
+            n = int(len(a0) * 16000 / sr0)
+            a16 = np.interp(np.linspace(0, len(a0), n), np.arange(len(a0)),
+                            np.asarray(a0, dtype=np.float64)).astype(np.float32)
+            segs, info = m.transcribe(a16, beam_size=5)
+            prompt_text = "".join(s.text for s in segs)
+            heard_lang = info.language
+            print(f"vc auto-transcribe [{heard_lang}]: {prompt_text[:60]!r}", flush=True)
+        except Exception as e:
+            raise HTTPException(500, f"auto-transcribe failed, pass prompt_text explicitly: {e}")
+    lang = prompt_language if prompt_language != "auto" else (heard_lang or "ja")
+    prompt = tts._get_prompt(tts.cnhubert_model, sov_cpu, src)
+    from gsv_tts.TTS import get_phones_and_bert
+    phones, _, _, _ = get_phones_and_bert(prompt_text, tts.tts_config, lang)
+    with torch.inference_mode():
+        audio, _ = svx.decode(prompt.unsqueeze(0).to("xpu"),
+                              torch.LongTensor(phones).unsqueeze(0).to("xpu"),
+                              ge.to("xpu"), noise_scale=noise_scale, speed=1.0)
+    a = audio[0, 0, :].float().cpu().numpy()
+    mx = np.abs(a).max()
+    if mx > 1:
+        a = a / mx
+    a = np.concatenate([a, np.zeros(int(0.2 * SR), dtype=a.dtype)])
+    out = os.path.join(tempfile.gettempdir(), f"vc_out_{int(time.time()*1000)}.wav")
+    sf.write(out, a, SR)
+    print(f"vc done: {len(a)/SR:.1f}s lang={lang}", flush=True)
+    return FileResponse(out, media_type="audio/wav", filename=os.path.basename(out))
 
 
 if __name__ == "__main__":
