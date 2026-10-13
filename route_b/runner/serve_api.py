@@ -87,8 +87,10 @@ _Y_SELECT_N = int(os.environ.get("Y_SELECT_N", "3"))  # resyn 早停，有好即
 
 def _y_cache_key(audio_path, prompt_text="", lang=""):
     # 内容哈希（y 只与音频有关；上传随机名/转写文本差异都不应影响命中）
+    # 后端标记：torch/ov 提法不同值，串味必糊
     st = os.stat(audio_path)
-    h = hashlib.sha1(f"{st.st_size}|".encode())
+    be = os.environ.get("GSV_HUBERT_BACKEND", "torch").lower()
+    h = hashlib.sha1(f"{st.st_size}|{be}|".encode())
     with open(audio_path, "rb") as f:
         h.update(f.read(1 << 20))
         f.seek(max(0, st.st_size - (1 << 20)))
