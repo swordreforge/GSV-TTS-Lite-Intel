@@ -355,6 +355,9 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
 - **克隆摆烂第二因（参考语言错配）**：参考音频是中文但前端选 ja 时，
   ja 前端（JPCommonLabel）啃中文报 "No phoneme"，条件全错 → 生成 9 码即 EOS 摆烂（实测 3/6）；
   参考语言选 zh 则 6/6。修法：webui 上传时自动转写并检测语言，覆盖手选项。
+- **克隆修复验收**：原样前端参数（上传 32uwgy + ja 目标）修复前 0/9（SEGV/500），
+  修复后 9/9 成功、服务不倒；输出 ASR="こんにちは" 内容正确。三重修复：ge 改 CPU 算（根治 SEGV）+ 上传自动检测参考语言
+  （治语言错配摆烂）+ 空生成无条件重试 3 次（治残余偶发空生成）。
 - **服务持久化**：`gsv-api.service` + `gsv-webui.service`（systemd user unit，linger 已开，重启/掉线自拉起）；日志落 `~/.cache/gsv/log/api.log|webui.log`（/tmp 重启会清）。
 - **音色管理**：`/voices` 增删改查 + `voice=` 一键切换（显式字段优先），已全流程验收。
 - **服务整洁**：lifespan（去 on_event 告警）+ 启动预热（两 runner 各一次 tiny 合成）+
