@@ -350,11 +350,21 @@ def _synth(req: TTSReq) -> str:
         with _lease_runner() as _srv:
             _srv.job(jd + "/", tokbin, top_k=req.top_k, seed=seed, rep=req.repetition_penalty)
         toks = np.fromfile(tokbin, np.int64)
+        # 取证+验毒：tokbin 落盘一份（/tmp 重启丢，仅供当轮排障）
+        try:
+            import shutil as _sh
+            _sh.copyfile(tokbin, f"/tmp/opencode/last_tok_{i}a{seed}.bin")
+        except Exception:
+            pass
         # torch 切片规则复刻：去 t0，首个 EOS 截断（driver.py:130），再剥 prompt 回声
         seq = toks[1:]
         eos = np.where(seq == EOS)[0]
         if len(eos):
             seq = seq[:eos[0]]
+        if len(seq) and (seq.min() < 0 or seq.max() > EOS):
+            print(f"chunk {i}: POISON tokens (min={seq.min()} max={seq.max()} len={len(seq)}), "
+                  f"seed={seed}, refusing", flush=True)
+            return np.zeros(0, dtype=np.float32), norm_txt
         n0 = len(seq)
         seq = strip_prompt_echo(seq, prompt.numpy().reshape(-1))
         if len(seq) != n0:
