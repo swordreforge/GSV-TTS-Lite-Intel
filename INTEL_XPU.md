@@ -338,6 +338,10 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
 - **VC 可用**：好 y 缓存命中后一次过（“違う…違う…でや…キサマは…”无复读无口吃）；
   y 缓存改内容哈希 key（上传随机名也能命中）；跨进程抽签、线程数都不是主因。
 - **WebUI**：`route_b/runner/webui.py`（:7860）薄前端调 API，页面 200。
+- **专属模型实测**（luming v2-pro-plus：GPT e14 + SoVITS e12_s372）：
+  ckpt→gguf 295 tensors 一次过；独立 :9881 实例（GPT_GGUF）+ voice 预设。短句全对，30字整句早停（2.9s），
+  cut_minlen=10 细切后结构全对但生僻词含糊（深层→深槽）——训得浅（372 steps）的上限。hybrid（底座GPT+luming SoVITS）
+  在 :9880 触发 native heap 崩溃，已删预设、主服务恢复；外来 .pth 不进主实例。模型包 313M 仅本地（gitignore）。
 - **服务持久化**：`gsv-api.service` + `gsv-webui.service`（systemd user unit，linger 已开，重启/掉线自拉起）；日志落 `~/.cache/gsv/log/api.log|webui.log`（/tmp 重启会清）。
 - **音色管理**：`/voices` 增删改查 + `voice=` 一键切换（显式字段优先），已全流程验收。
 - **服务整洁**：lifespan（去 on_event 告警）+ 启动预热（两 runner 各一次 tiny 合成）+

@@ -52,3 +52,6 @@ presets
 
 # Downloaded/local model files for API usage
 models/
+
+# user fine-tuned model packs (large, local only)
+luming-gpt-sovits-v2-pro-plus/
