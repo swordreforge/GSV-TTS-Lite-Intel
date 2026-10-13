@@ -396,7 +396,9 @@ static int run_job(int * ntoks_out) {
     so.top_k = getenv("RUNNER_TOP_K") ? atoi(getenv("RUNNER_TOP_K")) : 1;
     so.top_p = 1.0f; so.temp = 1.0f;
     so.rep = getenv("RUNNER_REP") ? (float)atof(getenv("RUNNER_REP")) : 1.35f;
-    printf("sampler: top_k=%d rep=%.2f\n", so.top_k, so.rep);
+    so.nrn = getenv("RUNNER_NOREPEAT") ? atoi(getenv("RUNNER_NOREPEAT")) : 0;
+    so.nrn_plen = (int)vy.size();
+    printf("sampler: top_k=%d rep=%.2f norepeat=%d\n", so.top_k, so.rep, so.nrn);
     // teacher-forcing：RUNNER_FORCE_FILE 指定 token 序列（含t0），逐 yo步喂入不采样
     std::vector<int> forced;
     if (getenv("RUNNER_FORCE_FILE")) {
