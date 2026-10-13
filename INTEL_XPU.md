@@ -331,6 +331,7 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   同 job 双跑：19s→12.5s，tokens 与单次逐位一致。二进制放 `~/.cache/gsv/bin`（/tmp 重启丢）。
 - **API 服务**（`route_b/runner/serve_api.py :9880`）：常驻 runner + CPU准备/XPU解码，
   `POST /tts` 切分长文本串行合成。验收：短句 10s 真语音（rms 0.1)，第二请求 29s→7s。
+- **音色管理**：`/voices` 增删改查 + `voice=` 一键切换（显式字段优先），已全流程验收。
 - **服务整洁**：lifespan（去 on_event 告警）+ 启动预热（两 runner 各一次 tiny 合成）+
   runner pool×2 并行（双发同起同落 5s wall，串行要 ~10s）。长文本不再独占全服。
 - **长文本**：cut_minlen 默认 30 + `GET /progress`（current/total）。
