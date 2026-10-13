@@ -83,11 +83,15 @@ _Y_SELECT_N = int(os.environ.get("Y_SELECT_N", "1"))  # 抽签并不可靠（常
 
 
 def _y_cache_key(audio_path, prompt_text, lang):
+    # 内容哈希（上传是 /tmp 随机名，path key 永不命中）
     st = os.stat(audio_path)
-    h = hashlib.sha1(
-        f"{os.path.abspath(audio_path)}|{st.st_mtime_ns}|{st.st_size}|{prompt_text}|{lang}".encode()
-    ).hexdigest()[:16]
-    return os.path.join(_Y_CACHE_DIR, h + ".ybin"), os.path.join(_Y_CACHE_DIR, h + ".json")
+    h = hashlib.sha1(f"{st.st_size}|{prompt_text}|{lang}".encode())
+    with open(audio_path, "rb") as f:
+        h.update(f.read(1 << 20))
+        f.seek(max(0, st.st_size - (1 << 20)))
+        h.update(f.read(1 << 20))
+    key = h.hexdigest()[:16]
+    return os.path.join(_Y_CACHE_DIR, key + ".ybin"), os.path.join(_Y_CACHE_DIR, key + ".json")
 
 
 def _y_score(ybin):
