@@ -344,6 +344,8 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   B 家族 uniq~50/sil20%→漫游），同进程确定、跨进程开奖，warming/线程数都不是主因。
   工程解：好 y 落盘（`~/.cache/gsv/prompt_y/`）+ `PROMPT_Y_FILE` 覆盖，
   已验 0.9s 干脆 “こんにちは”（之前坏 y 出 9.7s 前缀垃圾）。新音频待自动优选。
+  B-y 截短对照：全/头半/尾半一律 240+（A 全/尾 23~25）；y 家族定责闭环。
+  机制层面排除到只剩 Hubert 前向进程级彩票（warmup/线程/init/路径/device-path 均已证伪或不一致）。
 - **三语可用**：中文“你好,很高兴认识你” / 英文“Hello, nice to meet you.” 转写逐字命中，
   prompt_language 修复后跨语言干净（2~3s，无前缀）。
 - **按 token 流式**（`POST /tts/stream`，f32le 裸流）：runner `TOK` 行驱动，
