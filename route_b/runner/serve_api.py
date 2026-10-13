@@ -79,13 +79,13 @@ def strip_prompt_echo(sampled, prompt, maxk=12, mink=3):
 
 
 _Y_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "gsv", "prompt_y")
-_Y_SELECT_N = int(os.environ.get("Y_SELECT_N", "1"))  # 抽签并不可靠（常全 B），默认单次+告警，人工 curated 为主
+_Y_SELECT_N = int(os.environ.get("Y_SELECT_N", "3"))  # resyn 早停，有好即收
 
 
-def _y_cache_key(audio_path, prompt_text, lang):
-    # 内容哈希（上传是 /tmp 随机名，path key 永不命中）
+def _y_cache_key(audio_path, prompt_text="", lang=""):
+    # 内容哈希（y 只与音频有关；上传随机名/转写文本差异都不应影响命中）
     st = os.stat(audio_path)
-    h = hashlib.sha1(f"{st.st_size}|{prompt_text}|{lang}".encode())
+    h = hashlib.sha1(f"{st.st_size}|".encode())
     with open(audio_path, "rb") as f:
         h.update(f.read(1 << 20))
         f.seek(max(0, st.st_size - (1 << 20)))
@@ -173,7 +173,7 @@ def ensure_good_y(audio_path, prompt_text="?", lang="?", n_try=None, resyn=None)
         raise RuntimeError("y-select: all extractions failed")
     stats.sort(key=lambda t: -t[0])
     if resyn is not None:
-        # 内容分复选：逐个重合成打分，≥0.6 早停，否则取最高
+        # 内容分复选：逐个重合成打分，≥0.3 早停，否则取最高
         rescored = []
         for score, k, out, meta_k in stats:
             try:
@@ -183,7 +183,7 @@ def ensure_good_y(audio_path, prompt_text="?", lang="?", n_try=None, resyn=None)
                 continue
             meta_k["resyn_ratio"] = round(r, 4)
             rescored.append((r, k, out, meta_k))
-            if r >= 0.6:
+            if r >= 0.3:
                 print(f"y-select cand {k}: resyn {r:.3f} good enough, stop", flush=True)
                 break
         if rescored:
