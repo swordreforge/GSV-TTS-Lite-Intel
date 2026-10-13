@@ -348,6 +348,7 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   每 25 token 一窗 SoVITS（valid_start+sola，同 torch stream 规则），首音秒级。
   短句：流式 5.8s vs 非流式 6.3s（差交叠裁剪+头静音，符合预期）。
   好 y + trim/strip 后重验：1.3s 干脆“こんにちは”，首包可用。
+  `verify:true` 首窗门：idx=0 PASS，1.4s。
   血泪教训：sola/head 的 alpha 建在 CPU TTS device 上，音频在 XPU——调 XPU 实例方法。
 - **回声普查**（`route_b/validation/echo_census.py`）：seed 生效且跨进程确定；
   同语言回声 0~1（干净），跨语言 prompt 回声 3（serving 已剥）；
