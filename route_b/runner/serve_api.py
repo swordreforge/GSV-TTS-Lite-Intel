@@ -78,7 +78,7 @@ def strip_prompt_echo(sampled, prompt, maxk=12, mink=3):
 
 
 _Y_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "gsv", "prompt_y")
-_Y_SELECT_N = int(os.environ.get("Y_SELECT_N", "3"))
+_Y_SELECT_N = int(os.environ.get("Y_SELECT_N", "1"))  # 抽签并不可靠（常全 B），默认单次+告警，人工 curated 为主
 
 
 def _y_cache_key(audio_path, prompt_text, lang):
@@ -110,47 +110,70 @@ def ensure_good_y(audio_path, prompt_text="?", lang="?", n_try=None):
     os.makedirs(_Y_CACHE_DIR, exist_ok=True)
     _ensure_oneapi_env()
     cands = []
-    procs = []
+    # 串行抽签（并行同负载调度一致，无意义）+ 轮换线程数逼出调度差异
+    thread_cycle = ["16", "1", "4", "8", "2"]
+    stats = []
+    import shutil
     for k in range(n_try):
         out = os.path.join(tempfile.gettempdir(), f"ysel_{os.getpid()}_{k}.bin")
-        cands.append(out)
         env = dict(os.environ)
         env["SYCL_CACHE_PERSISTENT"] = "0"
-        procs.append(subprocess.Popen(
-            [sys.executable, os.path.join(_HERE, "extract_y.py"), audio_path, out, "xpu"],
-            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True))
-    stats = []
-    for k, p in enumerate(procs):
+        env["OMP_NUM_THREADS"] = thread_cycle[k % len(thread_cycle)]
+        env["MKL_NUM_THREADS"] = thread_cycle[k % len(thread_cycle)]
         try:
-            so, _ = p.communicate(timeout=900)
-            print(f"y-select cand {k}: {so.strip().splitlines()[-1] if so.strip() else 'no-output'}", flush=True)
+            r = subprocess.run(
+                [sys.executable, os.path.join(_HERE, "extract_y.py"), audio_path, out, "xpu"],
+                env=env, capture_output=True, text=True, timeout=900)
+            print(f"y-select cand {k} (threads={thread_cycle[k % len(thread_cycle)]}): "
+                  f"{r.stdout.strip().splitlines()[-1] if r.stdout.strip() else 'no-output'}", flush=True)
         except subprocess.TimeoutExpired:
-            p.kill()
             print(f"y-select cand {k}: TIMEOUT", flush=True)
             continue
-        if p.returncode != 0 or not os.path.exists(cands[k]):
-            print(f"y-select cand {k}: FAILED rc={p.returncode}", flush=True)
+        if r.returncode != 0 or not os.path.exists(out):
+            print(f"y-select cand {k}: FAILED rc={r.returncode}", flush=True)
             continue
-        score, meta_k = _y_score(cands[k])
-        stats.append((score, k, meta_k))
+        score, meta_k = _y_score(out)
+        stats.append((score, k, out, meta_k))
+        cands.append(out)
     if not stats:
         raise RuntimeError("y-select: all extractions failed")
     stats.sort(key=lambda t: -t[0])
-    best_score, best_k, best_meta = stats[0]
-    import shutil
-    shutil.copyfile(cands[best_k], ybin)
-    best_meta.update({"audio": audio_path, "prompt_text": prompt_text, "lang": lang,
-                      "score": round(best_score, 4), "n_try": n_try,
-                      "all": [(s, m) for s, _, m in stats]})
+    best_score, best_k, best_out, best_meta = stats[0]
+    shutil.copyfile(best_out, ybin)
+    meta_doc = dict(best_meta)
+    meta_doc.update({"audio": audio_path, "prompt_text": prompt_text, "lang": lang,
+                     "score": round(best_score, 4), "n_try": n_try,
+                     "all": [{"score": round(s, 4), **m} for s, _, _, m in stats]})
     with open(meta, "w") as f:
-        json.dump(best_meta, f, ensure_ascii=False, indent=1)
+        json.dump(meta_doc, f, ensure_ascii=False, indent=1)
     for c in cands:
         try:
             os.remove(c)
         except OSError:
             pass
     print(f"prompt y selected: {ybin} score={best_score:.3f} {best_meta}", flush=True)
+    if best_score < 0.35:
+        print(f"WARNING: y looks collapsed (uniq/len={best_score:.3f}); "
+              f"expect rambling — re-extract or curate manually, see INTEL_XPU.md", flush=True)
     return ybin
+
+
+@app.post("/refresh_prompt")
+def refresh_prompt(prompt_audio: str = "examples/AnAn.ogg",
+                   prompt_text: str = "?", lang: str = "?"):
+    """删缓存重提 y（抽签，返回统计；uniq 高者赢，服务重启或下次请求生效）。"""
+    import glob as _glob
+    deleted = 0
+    for f in _glob.glob(os.path.join(_Y_CACHE_DIR, "*")):
+        if ".good." in os.path.basename(f):
+            continue  # curated 资产不动
+        try:
+            os.remove(f)
+            deleted += 1
+        except OSError:
+            pass
+    ybin = ensure_good_y(prompt_audio, prompt_text, lang)
+    return {"ybin": ybin, "deleted": deleted}
 
 
 def _ensure_oneapi_env():
