@@ -359,6 +359,10 @@ def _synth(req: TTSReq) -> str:
         seq = strip_prompt_echo(seq, prompt.numpy().reshape(-1))
         if len(seq) != n0:
             print(f"echo stripped: {n0} -> {len(seq)}", flush=True)
+        if len(seq) == 0:
+            # runner 直接 EOS：不进 SoVITS（空输入无意义），交由重试循环处理
+            print(f"chunk {i}: empty generation (immediate EOS), seed={seed}", flush=True)
+            return np.zeros(0, dtype=np.float32), norm_txt
         with torch.inference_mode():
             codes = torch.from_numpy(seq).unsqueeze(0).unsqueeze(0).to("xpu")
             ph2 = torch.LongTensor(phones2).unsqueeze(0).to("xpu")
@@ -377,6 +381,13 @@ def _synth(req: TTSReq) -> str:
             for att in range(attempts):
                 seed = base_seed + att * 7919 + i
                 audio, norm_txt = _one_chunk(tc, f"{i}a{att}", wd, seed)
+                if len(audio) == 0:
+                    print(f"chunk {i} attempt {att} empty generation, retrying", flush=True)
+                    try:
+                        torch.xpu.empty_cache()
+                    except Exception:
+                        pass
+                    continue
                 best = audio
                 if not req.verify:
                     break
@@ -387,6 +398,9 @@ def _synth(req: TTSReq) -> str:
                     torch.xpu.empty_cache()  # 重试前放掉 XPU 缓存，防止重试风暴堆爆显存
                 except Exception:
                     pass
+            if best is None:
+                raise HTTPException(500, f"chunk {i}: empty generation on all attempts "
+                                         "(immediate EOS); try shorter text or another seed")
             chunks.append(best)
     mute = np.zeros(int(req.cut_mute * SR), dtype=np.float32)
     wav = chunks[0]

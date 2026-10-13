@@ -342,6 +342,10 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   ckpt→gguf 295 tensors 一次过；独立 :9881 实例（GPT_GGUF）+ voice 预设。短句全对，30字整句早停（2.9s），
   cut_minlen=10 细切后结构全对但生僻词含糊（深层→深槽）——训得浅（372 steps）的上限。hybrid（底座GPT+luming SoVITS）
   在 :9880 触发 native heap 崩溃，已删预设、主服务恢复；外来 .pth 不进主实例。模型包 313M 仅本地（gitignore）。
+- **克隆崩溃结案**（7 次 ABRT/SEGV）：浏览器发包经 playwright 抓包无畸形；y 值域 0~1021 正常；
+  空 seq 只是干净 Python 异常；8 seed 隔离全 clean——输入侧全洗脱，定为 XPU 并发 flake
+  （torch-xpu+SYCL+oneDNN 共卡，heap 腐蚀签名，负载高时 Level Zero 相伴报错）。faulthandler 常驻取证；
+  空生成改明 500（不再静默空 wav）；systemd 10s 自拉起（窗口 ~2min 系模型加载）。
 - **服务持久化**：`gsv-api.service` + `gsv-webui.service`（systemd user unit，linger 已开，重启/掉线自拉起）；日志落 `~/.cache/gsv/log/api.log|webui.log`（/tmp 重启会清）。
 - **音色管理**：`/voices` 增删改查 + `voice=` 一键切换（显式字段优先），已全流程验收。
 - **服务整洁**：lifespan（去 on_event 告警）+ 启动预热（两 runner 各一次 tiny 合成）+
