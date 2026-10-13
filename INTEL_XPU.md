@@ -352,6 +352,9 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   svx 仍用 XPU 模型。修复后前端克隆 3/3 不再崩（从 SEGV/RemoteDisconnected 变为干净 500/200）。
   排查弯路记录：前端发包（playwright 抓包）无畸形、phone id 不越界（max323<732）、空/失控/毒 token 全否、
   并发/老化/线程均清白——唯一变量是 ge 的计算设备。
+- **克隆摆烂第二因（参考语言错配）**：参考音频是中文但前端选 ja 时，
+  ja 前端（JPCommonLabel）啃中文报 "No phoneme"，条件全错 → 生成 9 码即 EOS 摆烂（实测 3/6）；
+  参考语言选 zh 则 6/6。修法：webui 上传时自动转写并检测语言，覆盖手选项。
 - **服务持久化**：`gsv-api.service` + `gsv-webui.service`（systemd user unit，linger 已开，重启/掉线自拉起）；日志落 `~/.cache/gsv/log/api.log|webui.log`（/tmp 重启会清）。
 - **音色管理**：`/voices` 增删改查 + `voice=` 一键切换（显式字段优先），已全流程验收。
 - **服务整洁**：lifespan（去 on_event 告警）+ 启动预热（两 runner 各一次 tiny 合成）+
