@@ -370,6 +370,86 @@ def _chunk_passes(audio_np, norm_text, language):
         return True
 
 
+_VOICES_FILE = os.path.join(os.path.expanduser("~"), ".cache", "gsv", "voices.json")
+_BUILTIN_VOICES = {
+    "default": {"spk": "examples/laffey.mp3", "prompt_audio": "examples/AnAn.ogg",
+                "prompt_text": "ちが……ちがう。レイア、貴様は間違っている。",
+                "prompt_language": "ja", "sovits_model": None},
+}
+
+
+def _load_voices():
+    try:
+        with open(_VOICES_FILE) as f:
+            d = json.load(f)
+            return {**_BUILTIN_VOICES, **d}
+    except (OSError, ValueError):
+        return dict(_BUILTIN_VOICES)
+
+
+def _save_voices(d):
+    os.makedirs(os.path.dirname(_VOICES_FILE), exist_ok=True)
+    user = {k: v for k, v in d.items() if k not in _BUILTIN_VOICES}
+    with open(_VOICES_FILE, "w") as f:
+        json.dump(user, f, ensure_ascii=False, indent=1)
+
+
+@app.get("/voices")
+def list_voices():
+    return _load_voices()
+
+
+class VoiceDef(BaseModel):
+    name: str
+    spk: str = "examples/laffey.mp3"
+    prompt_audio: str = "examples/AnAn.ogg"
+    prompt_text: str = "ちが……ちがう。レイア、貴様は間違っている。"
+    prompt_language: str = "ja"
+    sovits_model: str | None = None
+
+
+@app.post("/voices")
+def upsert_voice(v: VoiceDef):
+    if not v.name or not v.name.strip():
+        raise HTTPException(400, "empty name")
+    for key in ("spk", "prompt_audio"):
+        p = getattr(v, key)
+        if not os.path.exists(p):
+            raise HTTPException(400, f"file not found: {key}={p}")
+    d = _load_voices()
+    d[v.name] = {"spk": v.spk, "prompt_audio": v.prompt_audio, "prompt_text": v.prompt_text,
+                 "prompt_language": v.prompt_language, "sovits_model": v.sovits_model}
+    _save_voices(d)
+    return {"ok": True, "name": v.name}
+
+
+@app.delete("/voices/{name}")
+def delete_voice(name: str):
+    if name in _BUILTIN_VOICES:
+        raise HTTPException(400, "cannot delete builtin")
+    d = _load_voices()
+    if name not in d:
+        raise HTTPException(404, "no such voice")
+    del d[name]
+    _save_voices(d)
+    return {"ok": True, "name": name}
+
+
+def _apply_voice(req):
+    """voice 预设填参：显式传的字段优先（model_fields_set），其余取预设。"""
+    if not req.voice:
+        return req
+    d = _load_voices()
+    if req.voice not in d:
+        raise HTTPException(400, f"unknown voice: {req.voice}")
+    p = d[req.voice]
+    upd = {}
+    for f in ("spk", "prompt_audio", "prompt_text", "prompt_language", "sovits_model"):
+        if f not in req.model_fields_set:
+            upd[f] = p[f]
+    return req.model_copy(update=upd)
+
+
 @app.get("/progress")
 def progress():
     return _prog
@@ -499,6 +579,7 @@ class TTSReq(BaseModel):
     noise_scale: float = 0.5  # 上游默认；0=确定性但发 flat/金属（parity 工具仍用 0）
     repetition_penalty: float = 1.35
     seed: int | None = None  # None=每次随机；固定 seed 则回声等问题可复现
+    voice: str | None = None  # 音色预设名（/voices 管理）；显式字段优先于预设
     verify: bool = False  # ASR 质量门：chunk 转写对不上目标头就重抽（最多 max_retries 次）
     max_retries: int = 2
     cut_minlen: int = 30  # 段越少总耗时越短；太大单段易撞 K=1024 上限被截断
@@ -625,6 +706,7 @@ def tts_stream(req: StreamReq):
     global _prog
     if not req.text or not req.text.strip():
         raise HTTPException(400, "empty text")
+    req = _apply_voice(req)
     # 无全局锁：并发由 runner pool 承接，生成器耗尽即收尾
 
     def gen():
@@ -644,6 +726,7 @@ def tts_endpoint(req: TTSReq):
     global _prog
     if not req.text or not req.text.strip():
         raise HTTPException(400, "empty text")
+    req = _apply_voice(req)
     try:
         path = _synth(req)
     except Exception as e:
