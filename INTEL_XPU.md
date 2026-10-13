@@ -331,6 +331,8 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   同 job 双跑：19s→12.5s，tokens 与单次逐位一致。二进制放 `~/.cache/gsv/bin`（/tmp 重启丢）。
 - **API 服务**（`route_b/runner/serve_api.py :9880`）：常驻 runner + CPU准备/XPU解码，
   `POST /tts` 切分长文本串行合成。验收：短句 10s 真语音（rms 0.1)，第二请求 29s→7s。
+- **Hubert 改 OV 后端**：torch 版跨进程抽签（A/B 家族），OV 版确定（0 漂移）且两次全是好家族
+  （AnAn 94/0、32uwgy 209/0）；OV-y 重合成 0.52 全场最佳。服务已切 OV+后端标记缓存。
 - **VC 可用**：好 y 缓存命中后一次过（“違う…違う…でや…キサマは…”无复读无口吃）；
   y 缓存改内容哈希 key（上传随机名也能命中）；跨进程抽签、线程数都不是主因。
 - **WebUI**：`route_b/runner/webui.py`（:7860）薄前端调 API，页面 200。
