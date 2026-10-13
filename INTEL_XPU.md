@@ -342,6 +342,12 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
 - **音色管理**：`/voices` 增删改查 + `voice=` 一键切换（显式字段优先），已全流程验收。
 - **服务整洁**：lifespan（去 on_event 告警）+ 启动预热（两 runner 各一次 tiny 合成）+
   runner pool×2 并行（双发同起同落 5s wall，串行要 ~10s）。长文本不再独占全服。
+- **E2E profile**（`route_b/validation/prof_e2e.py`，稳态 y/ge 缓存命中）：
+  GPT decode 稳态 ~19ms/step（s=50/100/150 实测 19.0/19.2ms；step0 2.9s 系 SYCL 首算 JIT）；
+  SoVITS 热态 0.33 RTF、首调固定 ~2.3s（oneDNN 建图）；prefill 0.2s 可忽略。
+  暖态估算：ja 短句 ~1.4s，zh 30字 ~5.6s（RTF~0.9，其中 GPT 54% + SoVITS 36%）。
+  单发 runner 另付 gguf 加载+JIT ~4s（--serve 常驻已摊掉）。结论：无廉价大头可砍，瓶颈即 step 数×19ms。
+  附带教训：喂 SoVITS 必须去 t0 + EOS(1024) 截断 + 只喂目标 phones，否则 embedding 越界 abort。
 - **长文本**：cut_minlen 默认 30 + `GET /progress`（current/total）。
   1800 字：7 分钟出 11 分钟音频（段少静音垫料少；同文本上次 17.9 分钟系分段差异+采样方差）。
 - **新链路验收**：好 y 覆盖 + `verify:true` 门一次过（0.9s，转写头精确命中）。
