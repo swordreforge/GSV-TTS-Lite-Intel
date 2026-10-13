@@ -381,6 +381,10 @@ def _synth(req: TTSReq) -> str:
                 if _chunk_passes(audio, norm_txt, req.language):
                     break
                 print(f"chunk {i} attempt {att} failed gate, retrying", flush=True)
+                try:
+                    torch.xpu.empty_cache()  # 重试前放掉 XPU 缓存，防止重试风暴堆爆显存
+                except Exception:
+                    pass
             chunks.append(best)
     mute = np.zeros(int(req.cut_mute * SR), dtype=np.float32)
     wav = chunks[0]
