@@ -4,6 +4,8 @@
 多 chunk：复用 TTS.infer 的 cut_text，长文本分段后静音拼接。
 """
 import sys, os
+import faulthandler
+faulthandler.enable()  # native 崩溃时吐 Python 栈到日志（连环 heap/SEGV 取证中）
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 _ROOT = os.path.dirname(os.path.dirname(_HERE)) if os.path.basename(os.path.dirname(_HERE)) == "route_b" else _HERE
