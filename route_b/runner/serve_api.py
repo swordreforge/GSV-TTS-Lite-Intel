@@ -15,6 +15,7 @@ import threading
 import time
 import hashlib
 import json
+import contextlib
 import logging
 logging.disable(logging.INFO)
 
@@ -158,10 +159,11 @@ def ensure_good_y(audio_path, prompt_text="?", lang="?", n_try=None):
     return ybin
 
 
-app = FastAPI(title="GSV-TTS-Lite Intel API")
-_lock = threading.Lock()
+_POOL_SIZE = max(1, int(os.environ.get("RUNNER_POOL", "2")))
+_pool = []
+_pool_guard = threading.Lock()
+_pool_next = 0
 _prog = {"state": "idle", "current": 0, "total": 0}  # 原子替换读，无锁可读
-_rsrv: RunnerServer | None = None
 _tts = None
 _tts_x = None
 
@@ -178,23 +180,65 @@ def _get_tts():
     return _tts, _tts_x
 
 
-@app.on_event("startup")
-def _startup():
-    global _rsrv
+@contextlib.contextmanager
+def _lease_runner():
+    """轮询租一个空闲 runner；全忙则阻塞等第一个。请求级并行，长文本不再独占全服。"""
+    global _pool_next
+    with _pool_guard:
+        order = [_pool[(_pool_next + k) % len(_pool)] for k in range(len(_pool))]
+        _pool_next = (_pool_next + 1) % len(_pool)
+    for srv in order:
+        if srv.lock.acquire(blocking=False):
+            break
+    else:
+        srv = order[0]
+        srv.lock.acquire()
+    srv.busy = True
+    try:
+        yield srv
+    finally:
+        srv.busy = False
+        srv.lock.release()
+
+
+def _warmup():
+    print(f"warmup: tiny synth x{len(_pool)} (JIT all runners)...", flush=True)
+    for k in range(len(_pool)):
+        p = _synth(TTSReq(text="あ。"))
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+        print(f"warmup {k + 1}/{len(_pool)} ok", flush=True)
+
+
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def _lifespan(app):
+    global _pool
     _get_tts()
-    _rsrv = RunnerServer()
+    for i in range(_POOL_SIZE):
+        _pool.append(RunnerServer(i))
+    print(f"runner pool ready: {len(_pool)}", flush=True)
+    try:
+        _warmup()
+    except Exception as e:
+        print(f"warmup failed (non-fatal): {e}", flush=True)
+    yield
+    for s in _pool:
+        s.close()
 
 
-@app.on_event("shutdown")
-def _shutdown():
-    if _rsrv is not None:
-        _rsrv.close()
+app = FastAPI(title="GSV-TTS-Lite Intel API", lifespan=_lifespan)
+_rsrv: RunnerServer | None = None  # 兼容旧引用，实际走 _pool
 
 
 @app.get("/healthz")
 def healthz():
-    ok = _rsrv is not None and _rsrv.p.poll() is None
-    return {"runner_alive": ok}
+    info = [{"alive": s.p.poll() is None, "busy": s.busy} for s in _pool]
+    return {"runners": info, "runner_alive": any(i["alive"] for i in info)}
 
 
 def _synth(req: TTSReq) -> str:
@@ -230,7 +274,8 @@ def _synth(req: TTSReq) -> str:
         np.ascontiguousarray(bert.numpy()).tofile(os.path.join(jd, "bert.bin"))
         np.array([x.shape[1], prompt.shape[1]], dtype=np.int64).tofile(os.path.join(jd, "xlen_ylen.bin"))
         tokbin = os.path.join(jd, "tokens.bin")
-        _rsrv.job(jd + "/", tokbin, top_k=req.top_k, seed=seed, rep=req.repetition_penalty)
+        with _lease_runner() as _srv:
+            _srv.job(jd + "/", tokbin, top_k=req.top_k, seed=seed, rep=req.repetition_penalty)
         toks = np.fromfile(tokbin, np.int64)
         # torch 切片规则复刻：去 t0，首个 EOS 截断（driver.py:130），再剥 prompt 回声
         seq = toks[1:]
@@ -365,8 +410,11 @@ def _ensure_oneapi_env():
 class RunnerServer:
     """runner --serve 常驻进程，一次 JOB 一收发（调用方加锁串行）。"""
 
-    def __init__(self):
+    def __init__(self, idx=0):
         _ensure_oneapi_env()
+        self.idx = idx
+        self.lock = threading.Lock()
+        self.busy = False
         self._env = dict(os.environ)
         self._env["SYCL_CACHE_PERSISTENT"] = "0"  # 持久缓存本环境段错误，见 INTEL_XPU.md
         self._env["RUNNER_STREAM"] = "1"  # 每步打印 TOK <id>，job() 会忽略，job_stream() 消费
@@ -381,8 +429,9 @@ class RunnerServer:
         while True:
             line = self.p.stdout.readline()
             if not line:
-                raise RuntimeError("runner serve exited during init")
+                raise RuntimeError(f"runner[{self.idx}] serve exited during init")
             if "SERVE-READY" in line:
+                print(f"runner[{self.idx}] ready", flush=True)
                 return
 
     def _ensure_alive(self):
@@ -550,9 +599,10 @@ def _synth_stream(req: StreamReq):
                     q.put(decode_window(seq, False))
                     emitted = usable
 
-            _rsrv.job_stream(jd + "/", os.path.join(jd, "tokens.bin"),
-                             top_k=req.top_k, seed=base_seed + i, rep=req.repetition_penalty,
-                             on_token=on_token)
+            with _lease_runner() as _srv:
+                _srv.job_stream(jd + "/", os.path.join(jd, "tokens.bin"),
+                                top_k=req.top_k, seed=base_seed + i, rep=req.repetition_penalty,
+                                on_token=on_token)
             while not q.empty():
                 yield q.get().astype(np.float32).tobytes()
             # final flush：首个 EOS 截断 + 回声剥离（同非流式规则）
@@ -575,7 +625,8 @@ def tts_stream(req: StreamReq):
     global _prog
     if not req.text or not req.text.strip():
         raise HTTPException(400, "empty text")
-    _lock.acquire()  # 全程串行，生成器耗尽才释放
+    # 无全局锁：并发由 runner pool 承接，生成器耗尽即收尾
+
     def gen():
         try:
             yield from _synth_stream(req)
@@ -585,7 +636,6 @@ def tts_stream(req: StreamReq):
         finally:
             global _prog
             _prog = {"state": "idle", "current": 0, "total": 0}
-            _lock.release()
     return StreamingResponse(gen(), media_type="application/octet-stream")
 
 
@@ -594,12 +644,11 @@ def tts_endpoint(req: TTSReq):
     global _prog
     if not req.text or not req.text.strip():
         raise HTTPException(400, "empty text")
-    with _lock:  # runner 单通道 + XPU 状态，全局串行
-        try:
-            path = _synth(req)
-        except Exception as e:
-            _prog = {"state": "idle", "current": 0, "total": 0}
-            raise HTTPException(500, f"synth failed: {e}")
+    try:
+        path = _synth(req)
+    except Exception as e:
+        _prog = {"state": "idle", "current": 0, "total": 0}
+        raise HTTPException(500, f"synth failed: {e}")
     return FileResponse(path, media_type="audio/wav", filename=os.path.basename(path))
 
 
