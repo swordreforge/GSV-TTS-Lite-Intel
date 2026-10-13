@@ -338,8 +338,8 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   B 家族 uniq~50/sil20%→漫游），同进程确定、跨进程开奖，warming/线程数都不是主因。
   工程解：好 y 落盘（`~/.cache/gsv/prompt_y/`）+ `PROMPT_Y_FILE` 覆盖，
   已验 0.9s 干脆 “こんにちは”（之前坏 y 出 9.7s 前缀垃圾）。新音频待自动优选。
-- **三语可用**：中文/英文短句经 API 出声正常（6s，rms 0.09，无塌陷）；
-  内容级验证需人耳或 ASR（环境无 whisper，电平+时长只证明非静默非乱码）。
+- **三语可用**：中文“你好,很高兴认识你” / 英文“Hello, nice to meet you.” 转写逐字命中，
+  prompt_language 修复后跨语言干净（2~3s，无前缀）。
 - **按 token 流式**（`POST /tts/stream`，f32le 裸流）：runner `TOK` 行驱动，
   每 25 token 一窗 SoVITS（valid_start+sola，同 torch stream 规则），首音秒级。
   短句：流式 5.8s vs 非流式 6.3s（差交叠裁剪+头静音，符合预期）。
