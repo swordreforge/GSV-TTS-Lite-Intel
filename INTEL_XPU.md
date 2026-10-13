@@ -346,6 +346,12 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
   空 seq 只是干净 Python 异常；8 seed 隔离全 clean——输入侧全洗脱，定为 XPU 并发 flake
   （torch-xpu+SYCL+oneDNN 共卡，heap 腐蚀签名，负载高时 Level Zero 相伴报错）。faulthandler 常驻取证；
   空生成改明 500（不再静默空 wav）；systemd 10s 自拉起（窗口 ~2min 系模型加载）。
+- **克隆崩溃根因（已修）**：`tts_x._prepare_sovits_resources` 在 XPU 上算出的 speaker embedding `ge`
+  喂给 SoVITS `decode` 必 native SEGV；同一 ge 改在 CPU 计算后再 `.to("xpu")` 则 3/3 干净。
+  隔离 A/B 实锤（`route_b/validation/ge_ab.py`：CPU ge 全过、XPU ge 必崩）。修法：`_prepare_sv()` 统一 CPU 算 ge、
+  svx 仍用 XPU 模型。修复后前端克隆 3/3 不再崩（从 SEGV/RemoteDisconnected 变为干净 500/200）。
+  排查弯路记录：前端发包（playwright 抓包）无畸形、phone id 不越界（max323<732）、空/失控/毒 token 全否、
+  并发/老化/线程均清白——唯一变量是 ge 的计算设备。
 - **服务持久化**：`gsv-api.service` + `gsv-webui.service`（systemd user unit，linger 已开，重启/掉线自拉起）；日志落 `~/.cache/gsv/log/api.log|webui.log`（/tmp 重启会清）。
 - **音色管理**：`/voices` 增删改查 + `voice=` 一键切换（显式字段优先），已全流程验收。
 - **服务整洁**：lifespan（去 on_event 告警）+ 启动预热（两 runner 各一次 tiny 合成）+
