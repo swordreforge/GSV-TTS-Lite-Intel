@@ -235,6 +235,9 @@ _pool = []
 _pool_guard = threading.Lock()
 _pool_next = 0
 _prog = {"state": "idle", "current": 0, "total": 0}  # 原子替换读，无锁可读
+# XPU 串行锁：torch-xpu 解码 + SYCL runner 在并发下 native 崩（overlap 双杀实锤），整块串行。
+# 单用户体感无差；并发请求排队不死。
+_XPU_LOCK = threading.RLock()
 _tts = None
 _tts_x = None
 
