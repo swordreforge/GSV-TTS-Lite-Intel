@@ -13,6 +13,8 @@ import subprocess
 import tempfile
 import threading
 import time
+import hashlib
+import json
 import logging
 logging.disable(logging.INFO)
 
@@ -51,6 +53,20 @@ def _maybe_override_prompt(prompt):
     return prompt
 
 
+def _resolve_prompt(prompt, audio_path, prompt_text, lang):
+    """serving 用 y：显式文件优先，否则自动优选（落盘缓存）。"""
+    _pyf = os.environ.get("PROMPT_Y_FILE")
+    if _pyf and os.path.exists(_pyf):
+        return _maybe_override_prompt(prompt)
+    try:
+        ybin = ensure_good_y(audio_path, prompt_text, lang)
+        prompt = torch.from_numpy(np.fromfile(ybin, np.int64).reshape(1, -1))
+        print(f"prompt y auto-selected: {ybin}", flush=True)
+    except Exception as e:
+        print(f"prompt y auto-select failed ({e}), using prepared", flush=True)
+    return prompt
+
+
 def strip_prompt_echo(sampled, prompt, maxk=12, mink=3):
     """去头部 prompt 回声：sampled 头部若为 prompt 尾的续写则剥掉（只剥一次）。
     sampled=去t0 EOS截断后；prompt=y 的 numpy。serving 质量修正，parity 工具不用。"""
@@ -59,6 +75,82 @@ def strip_prompt_echo(sampled, prompt, maxk=12, mink=3):
         if list(sampled[:k]) == list(prompt[-k:]):
             return sampled[k:]
     return sampled
+
+
+_Y_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "gsv", "prompt_y")
+_Y_SELECT_N = int(os.environ.get("Y_SELECT_N", "3"))
+
+
+def _y_cache_key(audio_path, prompt_text, lang):
+    st = os.stat(audio_path)
+    h = hashlib.sha1(
+        f"{os.path.abspath(audio_path)}|{st.st_mtime_ns}|{st.st_size}|{prompt_text}|{lang}".encode()
+    ).hexdigest()[:16]
+    return os.path.join(_Y_CACHE_DIR, h + ".ybin"), os.path.join(_Y_CACHE_DIR, h + ".json")
+
+
+def _y_score(ybin):
+    a = np.fromfile(ybin, np.int64)
+    if len(a) == 0:
+        return -1.0, {}
+    import collections
+    c = collections.Counter(a.tolist())
+    return len(c) / len(a), {"len": len(a), "uniq": len(c),
+                             "sil239_frac": round(c.get(239, 0) / len(a), 4)}
+
+
+def ensure_good_y(audio_path, prompt_text="?", lang="?", n_try=None):
+    """新音频 y 自动优选：extract_y × N（并行子进程），uniq 占比最高者落盘缓存。
+    同进程重复提取无意义（0 漂移），必须跨进程抽签。返回 y 文件路径。"""
+    n_try = n_try or _Y_SELECT_N
+    ybin, meta = _y_cache_key(audio_path, prompt_text, lang)
+    if os.path.exists(ybin):
+        print(f"prompt y cache hit: {ybin}", flush=True)
+        return ybin
+    os.makedirs(_Y_CACHE_DIR, exist_ok=True)
+    _ensure_oneapi_env()
+    cands = []
+    procs = []
+    for k in range(n_try):
+        out = os.path.join(tempfile.gettempdir(), f"ysel_{os.getpid()}_{k}.bin")
+        cands.append(out)
+        env = dict(os.environ)
+        env["SYCL_CACHE_PERSISTENT"] = "0"
+        procs.append(subprocess.Popen(
+            [sys.executable, os.path.join(_HERE, "extract_y.py"), audio_path, out, "xpu"],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True))
+    stats = []
+    for k, p in enumerate(procs):
+        try:
+            so, _ = p.communicate(timeout=900)
+            print(f"y-select cand {k}: {so.strip().splitlines()[-1] if so.strip() else 'no-output'}", flush=True)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            print(f"y-select cand {k}: TIMEOUT", flush=True)
+            continue
+        if p.returncode != 0 or not os.path.exists(cands[k]):
+            print(f"y-select cand {k}: FAILED rc={p.returncode}", flush=True)
+            continue
+        score, meta_k = _y_score(cands[k])
+        stats.append((score, k, meta_k))
+    if not stats:
+        raise RuntimeError("y-select: all extractions failed")
+    stats.sort(key=lambda t: -t[0])
+    best_score, best_k, best_meta = stats[0]
+    import shutil
+    shutil.copyfile(cands[best_k], ybin)
+    best_meta.update({"audio": audio_path, "prompt_text": prompt_text, "lang": lang,
+                      "score": round(best_score, 4), "n_try": n_try,
+                      "all": [(s, m) for s, _, m in stats]})
+    with open(meta, "w") as f:
+        json.dump(best_meta, f, ensure_ascii=False, indent=1)
+    for c in cands:
+        try:
+            os.remove(c)
+        except OSError:
+            pass
+    print(f"prompt y selected: {ybin} score={best_score:.3f} {best_meta}", flush=True)
+    return ybin
 
 
 def _ensure_oneapi_env():
@@ -163,6 +255,8 @@ class TTSReq(BaseModel):
     noise_scale: float = 0.5  # 上游默认；0=确定性但发 flat/金属（parity 工具仍用 0）
     repetition_penalty: float = 1.35
     seed: int | None = None  # None=每次随机；固定 seed 则回声等问题可复现
+    verify: bool = False  # ASR 质量门：chunk 转写对不上目标头就重抽（最多 max_retries 次）
+    max_retries: int = 2
     cut_minlen: int = 30  # 段越少总耗时越短；太大单段易撞 K=1024 上限被截断
     cut_mute: float = 0.4  # 段间静音秒数
     sovits_model: str | None = None  # 微调 .pth 即插即用；None=默认
@@ -220,7 +314,7 @@ def _synth(req: TTSReq) -> str:
     svx = sovits_m.vq_model.eval()
     gpt_m, prompt, phones1, bert1 = tts._prepare_gpt_resources(
         str(tts.default_gpt_path), req.prompt_audio, req.prompt_text, req.prompt_language)
-    prompt = _maybe_override_prompt(prompt)
+    prompt = _resolve_prompt(prompt, req.prompt_audio, req.prompt_text, req.prompt_language)
 
     print(f"tts lang={req.language} prompt_lang={req.prompt_language} text={req.text[:20]!r}", flush=True)
     cuts = cut_text(req.text, req.cut_minlen)
@@ -229,39 +323,54 @@ def _synth(req: TTSReq) -> str:
     global _prog
     _prog = {"state": "running", "current": 0, "total": len(cuts)}
     chunks = []
+
+    def _one_chunk(tc, i, wd, seed):
+        phones2, _, bert2, norm_txt = get_phones_and_bert(tc, tts.tts_config, req.language)
+        x = torch.LongTensor(phones1 + phones2).unsqueeze(0)
+        bert = torch.cat([bert1, bert2]).unsqueeze(0)
+        jd = os.path.join(wd, f"c{i}")
+        os.makedirs(jd, exist_ok=True)
+        np.ascontiguousarray(x.numpy().astype(np.int64).reshape(-1)).tofile(os.path.join(jd, "x_ids.bin"))
+        np.ascontiguousarray(prompt.numpy().astype(np.int64).reshape(-1)).tofile(os.path.join(jd, "y.bin"))
+        np.ascontiguousarray(bert.numpy()).tofile(os.path.join(jd, "bert.bin"))
+        np.array([x.shape[1], prompt.shape[1]], dtype=np.int64).tofile(os.path.join(jd, "xlen_ylen.bin"))
+        tokbin = os.path.join(jd, "tokens.bin")
+        _rsrv.job(jd + "/", tokbin, top_k=req.top_k, seed=seed, rep=req.repetition_penalty)
+        toks = np.fromfile(tokbin, np.int64)
+        # torch 切片规则复刻：去 t0，首个 EOS 截断（driver.py:130），再剥 prompt 回声
+        seq = toks[1:]
+        eos = np.where(seq == EOS)[0]
+        if len(eos):
+            seq = seq[:eos[0]]
+        n0 = len(seq)
+        seq = strip_prompt_echo(seq, prompt.numpy().reshape(-1))
+        if len(seq) != n0:
+            print(f"echo stripped: {n0} -> {len(seq)}", flush=True)
+        with torch.inference_mode():
+            codes = torch.from_numpy(seq).unsqueeze(0).unsqueeze(0).to("xpu")
+            ph2 = torch.LongTensor(phones2).unsqueeze(0).to("xpu")
+            audio, _ = svx.decode(codes, ph2, ge.to("xpu"), cuda_graph=False, noise_scale=req.noise_scale)
+            audio = audio[0, 0, :]
+            audio = audio[tts_x._find_head_threshold_offsets(audio):]
+        return audio.detach().cpu().numpy().reshape(-1), norm_txt
+
+    import random as _rd
+    base_seed = req.seed if req.seed is not None else _rd.randint(0, 2**31 - 1)
     with tempfile.TemporaryDirectory(prefix="api_job_") as wd:
         for i, tc in enumerate(cuts):
             _prog = {"state": "running", "current": i + 1, "total": len(cuts)}
-            phones2, _, bert2, _ = get_phones_and_bert(tc, tts.tts_config, req.language)
-            x = torch.LongTensor(phones1 + phones2).unsqueeze(0)
-            bert = torch.cat([bert1, bert2]).unsqueeze(0)
-            jd = os.path.join(wd, f"c{i}")
-            os.makedirs(jd)
-            np.ascontiguousarray(x.numpy().astype(np.int64).reshape(-1)).tofile(os.path.join(jd, "x_ids.bin"))
-            np.ascontiguousarray(prompt.numpy().astype(np.int64).reshape(-1)).tofile(os.path.join(jd, "y.bin"))
-            np.ascontiguousarray(bert.numpy()).tofile(os.path.join(jd, "bert.bin"))
-            np.array([x.shape[1], prompt.shape[1]], dtype=np.int64).tofile(os.path.join(jd, "xlen_ylen.bin"))
-            tokbin = os.path.join(jd, "tokens.bin")
-            import random as _rd
-            base_seed = req.seed if req.seed is not None else _rd.randint(0, 2**31 - 1)
-            _rsrv.job(jd + "/", tokbin, top_k=req.top_k, seed=base_seed + i, rep=req.repetition_penalty)
-            toks = np.fromfile(tokbin, np.int64)
-            # torch 切片规则复刻：去 t0，首个 EOS 截断（driver.py:130），再剥 prompt 回声
-            seq = toks[1:]
-            eos = np.where(seq == EOS)[0]
-            if len(eos):
-                seq = seq[:eos[0]]
-            n0 = len(seq)
-            seq = strip_prompt_echo(seq, prompt.numpy().reshape(-1))
-            if len(seq) != n0:
-                print(f"echo stripped: {n0} -> {len(seq)}", flush=True)
-            with torch.inference_mode():
-                codes = torch.from_numpy(seq).unsqueeze(0).unsqueeze(0).to("xpu")
-                ph2 = torch.LongTensor(phones2).unsqueeze(0).to("xpu")
-                audio, _ = svx.decode(codes, ph2, ge.to("xpu"), cuda_graph=False, noise_scale=req.noise_scale)
-                audio = audio[0, 0, :]
-                audio = audio[tts_x._find_head_threshold_offsets(audio):]
-            chunks.append(audio.detach().cpu().numpy().reshape(-1))
+            attempts = 1 + (req.max_retries if req.verify else 0)
+            best = None
+            for att in range(attempts):
+                seed = base_seed + att * 7919 + i
+                audio, norm_txt = _one_chunk(tc, f"{i}a{att}", wd, seed)
+                best = audio
+                if not req.verify:
+                    break
+                if _chunk_passes(audio, norm_txt, req.language):
+                    break
+                print(f"chunk {i} attempt {att} failed gate, retrying", flush=True)
+            chunks.append(best)
     mute = np.zeros(int(req.cut_mute * SR), dtype=np.float32)
     wav = chunks[0]
     for c in chunks[1:]:
@@ -270,6 +379,55 @@ def _synth(req: TTSReq) -> str:
     sf.write(out, wav, SR)
     _prog = {"state": "idle", "current": 0, "total": 0}
     return out
+
+
+_asr_model = None
+
+
+def _get_asr():
+    global _asr_model
+    if _asr_model is None:
+        from faster_whisper import WhisperModel
+        _asr_model = WhisperModel("base", device="cpu", compute_type="int8")
+    return _asr_model
+
+
+import re as _re
+_PUNCT = _re.compile(r'[\s。、，「」『』…！？!?,.:;~・…、·\'"“”‘’（）()【】\-]+')
+
+
+def _norm_txt(s):
+    return _PUNCT.sub("", s)
+
+
+def _chunk_passes(audio_np, norm_text, language):
+    """ASR 门：chunk 转写头部须出现目标头（25 字内），否则判泄漏/复读。异常时放行不挡请求。"""
+    try:
+        m = _get_asr()
+    except Exception as e:
+        print(f"asr gate unavailable ({e}), passing", flush=True)
+        return True
+    try:
+        clip = audio_np[:45 * SR] if len(audio_np) > 45 * SR else audio_np
+        n = int(len(clip) * 16000 / SR)
+        a16 = np.interp(np.linspace(0, len(clip), n), np.arange(len(clip)),
+                        clip.astype(np.float64)).astype(np.float32)
+        kw = {"beam_size": 5}
+        if language in ("ja", "zh", "en"):
+            kw["language"] = language
+        segs, _ = m.transcribe(a16, **kw)
+        trans = _norm_txt("".join(s.text for s in segs))
+        tgt = _norm_txt(norm_text)[:12]
+        if len(tgt) < 4:
+            return True
+        idx = trans.find(tgt)
+        ok = 0 <= idx <= 25
+        print(f"asr gate: tgt={tgt[:12]!r} idx={idx} -> {'PASS' if ok else 'FAIL'} "
+              f"trans={trans[:40]!r}", flush=True)
+        return ok
+    except Exception as e:
+        print(f"asr gate error ({e}), passing", flush=True)
+        return True
 
 
 @app.get("/progress")
@@ -295,7 +453,7 @@ def _synth_stream(req: StreamReq):
     overlap_samples = req.overlap_len * svx.samples_per_frame
     gpt_m, prompt, phones1, bert1 = tts._prepare_gpt_resources(
         str(tts.default_gpt_path), req.prompt_audio, req.prompt_text, req.prompt_language)
-    prompt = _maybe_override_prompt(prompt)
+    prompt = _resolve_prompt(prompt, req.prompt_audio, req.prompt_text, req.prompt_language)
     print(f"tts lang={req.language} prompt_lang={req.prompt_language} text={req.text[:20]!r}", flush=True)
     cuts = cut_text(req.text, req.cut_minlen)
     if not cuts:
