@@ -47,18 +47,18 @@ SR = 32000
 
 def _maybe_override_prompt(prompt):
     """PROMPT_Y_FILE 有值则用盘上验过的好 y（prompt 抽签波动大，好 y 落盘复用）。"""
-    _pyf = os.environ.get("PROMPT_Y_FILE")
-    if _pyf and os.path.exists(_pyf):
-        prompt = torch.from_numpy(np.fromfile(_pyf, np.int64).reshape(1, -1))
-        print(f"prompt y overridden from {_pyf}", flush=True)
     return prompt
 
 
 def _resolve_prompt(prompt, audio_path, prompt_text, lang, resyn=None):
-    """serving 用 y：显式文件优先，否则自动优选（落盘缓存）。resyn 回调做内容验证。"""
+    """serving 用 y：显式文件优先（仅音频 basename 匹配时）否则自动优选（落盘缓存）。
+    resyn 回调做内容验证。"""
     _pyf = os.environ.get("PROMPT_Y_FILE")
-    if _pyf and os.path.exists(_pyf):
-        return _maybe_override_prompt(prompt)
+    _pya = os.environ.get("PROMPT_Y_AUDIO", "AnAn.ogg")
+    if _pyf and os.path.exists(_pyf) and os.path.basename(audio_path) == os.path.basename(_pya):
+        prompt = torch.from_numpy(np.fromfile(_pyf, np.int64).reshape(1, -1))
+        print(f"prompt y overridden from {_pyf}", flush=True)
+        return prompt
     try:
         ybin = ensure_good_y(audio_path, prompt_text, lang, resyn=resyn)
         prompt = torch.from_numpy(np.fromfile(ybin, np.int64).reshape(1, -1))
