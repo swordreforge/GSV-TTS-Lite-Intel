@@ -56,6 +56,22 @@ def _to_pcm16_wav(raw: bytes) -> bytes:
         return raw
 
 
+def _auto_transcribe(wav_path):
+    """参考音频自动转写（small/cpu，慢但免手填）。失败抛异常由调用方转 gr.Error。"""
+    import soundfile as sf
+    import numpy as np
+    from faster_whisper import WhisperModel
+    m = WhisperModel("small", device="cpu", compute_type="int8")
+    a, sr = sf.read(wav_path)
+    a = np.asarray(a, dtype=np.float64)
+    if getattr(a, "ndim", 1) > 1:
+        a = a.mean(axis=-1)
+    n = max(1, int(len(a) * 16000 / sr))
+    a16 = np.interp(np.linspace(0, len(a), n), np.arange(len(a)), a).astype(np.float32)
+    segs, _ = m.transcribe(a16, beam_size=5)
+    return "".join(s.text for s in segs).strip()
+
+
 def synth(text, voice, language, prompt_language, top_k, verify,
           prompt_upload, prompt_text, cut_minlen, sovits_model):
     import gradio as gr
@@ -71,7 +87,12 @@ def synth(text, voice, language, prompt_language, top_k, verify,
         except Exception as e:
             raise gr.Error(f"上传保存失败: {e}")
         if not (prompt_text or "").strip():
-            raise gr.Error("上传了参考音频必须填写参考文本（音频里说的内容）")
+            try:
+                prompt_text = _auto_transcribe(up)
+            except Exception as e:
+                raise gr.Error(f"参考音频自动转写失败（{e}），请手动填写参考文本")
+            if not prompt_text:
+                raise gr.Error("参考音频转写为空，请手动填写参考文本")
         payload["prompt_audio"] = up
         payload["prompt_text"] = prompt_text.strip()
         payload["spk"] = up
@@ -184,7 +205,7 @@ def main():
                     with gr.Accordion("一次性克隆（上传参考音频，不存预设）", open=False):
                         pup = gr.Audio(label="参考音频（上传，5秒以上干净干声）",
                                        type="filepath", sources=["upload"])
-                        ptext = gr.Textbox(label="参考文本（音频里说的内容，一字不差）",
+                        ptext = gr.Textbox(label="参考文本（空=自动转写；音频里说的内容）",
                                            lines=2, value="")
                     btn = gr.Button("合成", variant="primary")
                 with gr.Column():
