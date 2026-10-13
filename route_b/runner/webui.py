@@ -10,12 +10,12 @@ if _ROOT != _HERE:
 import argparse
 import json
 import tempfile
-import urllib.request
 
 API = os.environ.get("API_BASE", "http://localhost:9880")
 
 
 def _call(path, payload=None, method="GET"):
+    import urllib.request
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(API + path, data=data, method=method,
                                  headers={"Content-Type": "application/json"})
@@ -30,11 +30,11 @@ def _voices():
         return ["default"]
 
 
-def synth(text, voice, language, top_k, verify):
+def synth(text, voice, language, prompt_language, top_k, verify):
     import gradio as gr
     if not text or not text.strip():
         raise gr.Error("empty text")
-    payload = {"text": text, "language": language, "prompt_language": "ja",
+    payload = {"text": text, "language": language, "prompt_language": prompt_language,
                "top_k": int(top_k), "verify": bool(verify)}
     if voice and voice != "default":
         payload["voice"] = voice
@@ -50,6 +50,70 @@ def synth(text, voice, language, top_k, verify):
     return path
 
 
+def vc_convert(src_audio, spk_voice, prompt_text, prompt_language):
+    import gradio as gr
+    import requests
+    if not src_audio:
+        raise gr.Error("请上传源音频")
+    spk = "examples/laffey.mp3"
+    if spk_voice and spk_voice != "default":
+        try:
+            vs = json.loads(_call("/voices"))
+            if spk_voice in vs:
+                spk = vs[spk_voice]["spk"]
+        except Exception:
+            pass
+    data = {"spk": spk, "prompt_text": prompt_text or "",
+            "prompt_language": prompt_language}
+    with open(src_audio, "rb") as f:
+        files = {"file": (os.path.basename(src_audio), f.read())}
+    try:
+        r = requests.post(API + "/vc", data=data, files=files, timeout=1800)
+    except Exception as e:
+        raise gr.Error(f"API 不可达: {e}")
+    if r.status_code != 200:
+        raise gr.Error(f"API error {r.status_code}: {r.text[:200]}")
+    fd, path = tempfile.mkstemp(suffix=".wav", prefix="webui_vc_")
+    with os.fdopen(fd, "wb") as f:
+        f.write(r.content)
+    return path
+
+
+def voice_add(name, spk, prompt_audio, prompt_text, prompt_language):
+    import gradio as gr
+    if not name or not name.strip():
+        raise gr.Error("empty name")
+    payload = {"name": name.strip(), "spk": spk, "prompt_audio": prompt_audio,
+               "prompt_text": prompt_text, "prompt_language": prompt_language,
+               "sovits_model": None}
+    try:
+        r = _call("/voices", payload, method="POST")
+        json.loads(r)
+    except Exception as e:
+        raise gr.Error(f"add failed: {e}")
+    return refresh_voices()
+
+
+def voice_del(name):
+    import gradio as gr
+    import urllib.request
+    import urllib.error
+    try:
+        req = urllib.request.Request(API + "/voices/" + name, method="DELETE")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            r.read()
+    except Exception as e:
+        raise gr.Error(f"delete failed: {e}")
+    return refresh_voices()
+
+
+def refresh_voices():
+    import gradio as gr
+    vs = _voices()
+    table = [[k] for k in vs]
+    return gr.Dropdown(choices=vs, value="default"), table
+
+
 def main():
     import gradio as gr
     ap = argparse.ArgumentParser()
@@ -61,19 +125,52 @@ def main():
 
     with gr.Blocks(title="GSV-TTS-Lite (Intel)") as app:
         gr.Markdown("## GSV-TTS-Lite · Intel 后端（C++ GPT + XPU SoVITS）")
-        with gr.Row():
-            with gr.Column():
-                text = gr.Textbox(label="文本", lines=5, value="こんにちは。",
-                                  placeholder="输入要合成的文本…")
-                voice = gr.Dropdown(label="音色预设", choices=_voices(), value="default")
-                lang = gr.Radio(label="语言", choices=["ja", "zh", "en"], value="ja")
-                with gr.Row():
-                    top_k = gr.Slider(label="top_k", minimum=1, maximum=50, value=15, step=1)
-                    verify = gr.Checkbox(label="ASR 质量门（慢但稳）", value=False)
-                btn = gr.Button("合成", variant="primary")
-            with gr.Column():
-                audio = gr.Audio(label="输出", type="filepath")
-        btn.click(synth, inputs=[text, voice, lang, top_k, verify], outputs=[audio])
+        with gr.Tab("语音合成"):
+            with gr.Row():
+                with gr.Column():
+                    text = gr.Textbox(label="文本", lines=5, value="こんにちは。",
+                                      placeholder="输入要合成的文本…")
+                    voice = gr.Dropdown(label="音色预设", choices=_voices(), value="default")
+                    with gr.Row():
+                        lang = gr.Radio(label="目标语言", choices=["ja", "zh", "en"], value="ja")
+                        plang = gr.Radio(label="参考音频语言", choices=["ja", "zh", "en"], value="ja")
+                    with gr.Row():
+                        top_k = gr.Slider(label="top_k", minimum=1, maximum=50, value=15, step=1)
+                        verify = gr.Checkbox(label="ASR 质量门（慢但稳）", value=False)
+                    btn = gr.Button("合成", variant="primary")
+                with gr.Column():
+                    audio = gr.Audio(label="输出", type="filepath")
+            btn.click(synth, inputs=[text, voice, lang, plang, top_k, verify], outputs=[audio])
+        with gr.Tab("变声"):
+            with gr.Row():
+                with gr.Column():
+                    src = gr.Audio(label="源音频（上传）", type="filepath", sources=["upload"])
+                    spk_v = gr.Dropdown(label="目标音色（取其 spk）", choices=_voices(), value="default")
+                    ptext = gr.Textbox(label="源转写词（空=自动 ASR）", lines=2, value="")
+                    vclang = gr.Radio(label="源语言", choices=["auto", "ja", "zh", "en"], value="auto")
+                    vbtn = gr.Button("变声", variant="primary")
+                with gr.Column():
+                    vaudio = gr.Audio(label="输出", type="filepath")
+            vbtn.click(vc_convert, inputs=[src, spk_v, ptext, vclang], outputs=[vaudio])
+        with gr.Tab("音色预设"):
+            with gr.Row():
+                with gr.Column():
+                    vname = gr.Textbox(label="预设名", value="")
+                    vspk = gr.Textbox(label="spk 音频路径", value="examples/laffey.mp3")
+                    vpa = gr.Textbox(label="prompt 音频路径", value="examples/AnAn.ogg")
+                    vpt = gr.Textbox(label="prompt 文本", lines=2,
+                                     value="ちが……ちがう。レイア、貴様は間違っている。")
+                    vpl = gr.Radio(label="prompt 语言", choices=["ja", "zh", "en"], value="ja")
+                    with gr.Row():
+                        vadd = gr.Button("保存", variant="primary")
+                        vdel = gr.Button("删除所选")
+                with gr.Column():
+                    vtable = gr.Dataframe(label="现有预设", headers=["name"], col_count=(1, "fixed"))
+                    vsel = gr.Dropdown(label="选择", choices=_voices(), value="default")
+                    vref = gr.Button("刷新列表")
+            vadd.click(voice_add, inputs=[vname, vspk, vpa, vpt, vpl], outputs=[vsel, vtable])
+            vdel.click(voice_del, inputs=[vsel], outputs=[vsel, vtable])
+            vref.click(refresh_voices, outputs=[vsel, vtable])
     app.launch(server_name="0.0.0.0", server_port=args.port)
 
 
