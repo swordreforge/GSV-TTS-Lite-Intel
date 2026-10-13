@@ -409,7 +409,8 @@ def _synth(req: TTSReq) -> str:
     with tempfile.TemporaryDirectory(prefix="api_job_") as wd:
         for i, tc in enumerate(cuts):
             _prog = {"state": "running", "current": i + 1, "total": len(cuts)}
-            attempts = 1 + (req.max_retries if req.verify else 0)
+            # 空生成/门失败都重试；verify 只额外加 ASR 门，不决定是否重试
+            attempts = 1 + req.max_retries
             best = None
             for att in range(attempts):
                 seed = base_seed + att * 7919 + i
