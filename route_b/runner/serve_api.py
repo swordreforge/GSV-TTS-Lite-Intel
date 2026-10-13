@@ -363,6 +363,11 @@ def _synth(req: TTSReq) -> str:
             # runner 直接 EOS：不进 SoVITS（空输入无意义），交由重试循环处理
             print(f"chunk {i}: empty generation (immediate EOS), seed={seed}", flush=True)
             return np.zeros(0, dtype=np.float32), norm_txt
+        print(f"chunk {i}: codes={len(seq)} xlen={x.shape[1]} ylen={prompt.shape[1]}", flush=True)
+        if len(seq) > 600:
+            # runner 失控（无 EOS 狂奔）：500+ codes 的 SoVITS 解码是自杀行为，直接拒掉走重试
+            print(f"chunk {i}: runaway generation ({len(seq)} codes), seed={seed}, refusing", flush=True)
+            return np.zeros(0, dtype=np.float32), norm_txt
         with torch.inference_mode():
             codes = torch.from_numpy(seq).unsqueeze(0).unsqueeze(0).to("xpu")
             ph2 = torch.LongTensor(phones2).unsqueeze(0).to("xpu")
