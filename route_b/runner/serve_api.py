@@ -54,13 +54,13 @@ def _maybe_override_prompt(prompt):
     return prompt
 
 
-def _resolve_prompt(prompt, audio_path, prompt_text, lang):
-    """serving 用 y：显式文件优先，否则自动优选（落盘缓存）。"""
+def _resolve_prompt(prompt, audio_path, prompt_text, lang, resyn=None):
+    """serving 用 y：显式文件优先，否则自动优选（落盘缓存）。resyn 回调做内容验证。"""
     _pyf = os.environ.get("PROMPT_Y_FILE")
     if _pyf and os.path.exists(_pyf):
         return _maybe_override_prompt(prompt)
     try:
-        ybin = ensure_good_y(audio_path, prompt_text, lang)
+        ybin = ensure_good_y(audio_path, prompt_text, lang, resyn=resyn)
         prompt = torch.from_numpy(np.fromfile(ybin, np.int64).reshape(1, -1))
         print(f"prompt y auto-selected: {ybin}", flush=True)
     except Exception as e:
@@ -104,7 +104,36 @@ def _y_score(ybin):
                              "sil239_frac": round(c.get(239, 0) / len(a), 4)}
 
 
-def ensure_good_y(audio_path, prompt_text="?", lang="?", n_try=None):
+def _resyn_score(ybin, prompt_text, lang, svx, ge, tts):
+    """y 质检：重合成→转写→与 prompt 文本模糊比。返回 ratio（0~1）。"""
+    import soundfile as sf
+    from gsv_tts.TTS import get_phones_and_bert
+    y = np.fromfile(ybin, np.int64)
+    phones, _, _, _ = get_phones_and_bert(prompt_text, tts.tts_config, lang)
+    with torch.inference_mode():
+        audio, _ = svx.decode(torch.from_numpy(y).unsqueeze(0).unsqueeze(0).to("xpu"),
+                              torch.LongTensor(phones).unsqueeze(0).to("xpu"),
+                              ge.to("xpu") if isinstance(ge, torch.Tensor) else ge,
+                              cuda_graph=False, noise_scale=0)
+    a = audio.detach().cpu().numpy().reshape(-1)
+    n = int(len(a) * 16000 / SR)
+    a16 = np.interp(np.linspace(0, len(a), n), np.arange(len(a)), a).astype(np.float32)
+    m = _get_asr()
+    kw = {"beam_size": 5}
+    if lang in ("ja", "zh", "en"):
+        kw["language"] = lang
+    segs, _ = m.transcribe(a16, **kw)
+    from difflib import SequenceMatcher
+    t = _norm_txt("".join(s.text for s in segs))
+    ref = _norm_txt(prompt_text)
+    r = SequenceMatcher(None, t, ref).ratio() if ref else 0.0
+    print(f"y resyn check: ratio={r:.3f} trans={t[:50]!r}", flush=True)
+    return r
+
+
+def ensure_good_y(audio_path, prompt_text="?", lang="?", n_try=None, resyn=None):
+    """新音频 y 自动优选：extract_y × N（串行+线程轮换逼出调度差异）。
+    resyn 回调(ybin)->ratio 存在时按内容分选优（早停≥0.6），否则退化到 uniq 占比。"""
     """新音频 y 自动优选：extract_y × N（并行子进程），uniq 占比最高者落盘缓存。
     同进程重复提取无意义（0 漂移），必须跨进程抽签。返回 y 文件路径。"""
     n_try = n_try or _Y_SELECT_N
@@ -143,6 +172,23 @@ def ensure_good_y(audio_path, prompt_text="?", lang="?", n_try=None):
     if not stats:
         raise RuntimeError("y-select: all extractions failed")
     stats.sort(key=lambda t: -t[0])
+    if resyn is not None:
+        # 内容分复选：逐个重合成打分，≥0.6 早停，否则取最高
+        rescored = []
+        for score, k, out, meta_k in stats:
+            try:
+                r = resyn(out)
+            except Exception as e:
+                print(f"y-select cand {k}: resyn failed ({e})", flush=True)
+                continue
+            meta_k["resyn_ratio"] = round(r, 4)
+            rescored.append((r, k, out, meta_k))
+            if r >= 0.6:
+                print(f"y-select cand {k}: resyn {r:.3f} good enough, stop", flush=True)
+                break
+        if rescored:
+            rescored.sort(key=lambda t: -t[0])
+            stats = rescored
     best_score, best_k, best_out, best_meta = stats[0]
     shutil.copyfile(best_out, ybin)
     meta_doc = dict(best_meta)
@@ -157,8 +203,9 @@ def ensure_good_y(audio_path, prompt_text="?", lang="?", n_try=None):
         except OSError:
             pass
     print(f"prompt y selected: {ybin} score={best_score:.3f} {best_meta}", flush=True)
-    if best_score < 0.35:
-        print(f"WARNING: y looks collapsed (uniq/len={best_score:.3f}); "
+    _thr = 0.25 if resyn is not None else 0.35
+    if best_score < _thr:
+        print(f"WARNING: y looks collapsed (score={best_score:.3f}); "
               f"expect rambling — re-extract or curate manually, see INTEL_XPU.md", flush=True)
     return ybin
 
@@ -257,7 +304,9 @@ def _synth(req: TTSReq) -> str:
     svx = sovits_m.vq_model.eval()
     gpt_m, prompt, phones1, bert1 = tts._prepare_gpt_resources(
         str(tts.default_gpt_path), req.prompt_audio, req.prompt_text, req.prompt_language)
-    prompt = _resolve_prompt(prompt, req.prompt_audio, req.prompt_text, req.prompt_language)
+    prompt = _resolve_prompt(
+        prompt, req.prompt_audio, req.prompt_text, req.prompt_language,
+        resyn=lambda yb: _resyn_score(yb, req.prompt_text, req.prompt_language, svx, ge, tts))
 
     print(f"tts lang={req.language} prompt_lang={req.prompt_language} text={req.text[:20]!r}", flush=True)
     cuts = cut_text(req.text, req.cut_minlen)
@@ -610,7 +659,9 @@ def _synth_stream(req: StreamReq):
     overlap_samples = req.overlap_len * svx.samples_per_frame
     gpt_m, prompt, phones1, bert1 = tts._prepare_gpt_resources(
         str(tts.default_gpt_path), req.prompt_audio, req.prompt_text, req.prompt_language)
-    prompt = _resolve_prompt(prompt, req.prompt_audio, req.prompt_text, req.prompt_language)
+    prompt = _resolve_prompt(
+        prompt, req.prompt_audio, req.prompt_text, req.prompt_language,
+        resyn=lambda yb: _resyn_score(yb, req.prompt_text, req.prompt_language, svx, gex, tts))
     print(f"tts lang={req.language} prompt_lang={req.prompt_language} text={req.text[:20]!r}", flush=True)
     cuts = cut_text(req.text, req.cut_minlen)
     if not cuts:
@@ -813,7 +864,9 @@ async def vc_endpoint(file: UploadFile | None = File(None),
     lang = prompt_language if prompt_language != "auto" else (heard_lang or "ja")
     prompt = tts._get_prompt(tts.cnhubert_model, sov_cpu, src)
     try:
-        ybin = ensure_good_y(src, prompt_text, lang)
+        ybin = ensure_good_y(
+            src, prompt_text, lang,
+            resyn=lambda yb: _resyn_score(yb, prompt_text, lang, svx, ge, tts))
         prompt = torch.from_numpy(np.fromfile(ybin, np.int64).reshape(1, -1))
         print(f"vc prompt y: {ybin}", flush=True)
     except Exception as e:
