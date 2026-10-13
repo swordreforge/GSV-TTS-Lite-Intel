@@ -12,6 +12,18 @@ import json
 import tempfile
 
 API = os.environ.get("API_BASE", "http://localhost:9880")
+UPLOAD_DIR = os.path.join(os.path.expanduser("~"), ".cache", "gsv", "uploads")
+
+
+def _save_upload(src_path, prefix="prompt_"):
+    """浏览器上传 → 服务端持久路径（uploads 不在 /tmp，重启不丢）。"""
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    import re, time
+    base = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.basename(src_path or "up.wav"))[-60:]
+    dst = os.path.join(UPLOAD_DIR, f"{prefix}{int(time.time()*1000)}_{base}")
+    import shutil
+    shutil.copyfile(src_path, dst)
+    return dst
 
 
 def _call(path, payload=None, method="GET"):
@@ -30,14 +42,27 @@ def _voices():
         return ["default"]
 
 
-def synth(text, voice, language, prompt_language, top_k, verify):
+def synth(text, voice, language, prompt_language, top_k, verify,
+          prompt_upload, prompt_text, cut_minlen, sovits_model):
     import gradio as gr
     if not text or not text.strip():
         raise gr.Error("empty text")
     payload = {"text": text, "language": language, "prompt_language": prompt_language,
-               "top_k": int(top_k), "verify": bool(verify)}
+               "top_k": int(top_k), "verify": bool(verify), "cut_minlen": int(cut_minlen)}
     if voice and voice != "default":
         payload["voice"] = voice
+    if prompt_upload:  # 一次性克隆：上传优先于预设
+        try:
+            up = _save_upload(prompt_upload)
+        except Exception as e:
+            raise gr.Error(f"上传保存失败: {e}")
+        if not (prompt_text or "").strip():
+            raise gr.Error("上传了参考音频必须填写参考文本（音频里说的内容）")
+        payload["prompt_audio"] = up
+        payload["prompt_text"] = prompt_text.strip()
+        payload["spk"] = up
+    if (sovits_model or "").strip():
+        payload["sovits_model"] = sovits_model.strip()
     raw = _call("/tts", payload, method="POST")
     try:
         json.loads(raw)
@@ -79,13 +104,13 @@ def vc_convert(src_audio, spk_voice, prompt_text, prompt_language):
     return path
 
 
-def voice_add(name, spk, prompt_audio, prompt_text, prompt_language):
+def voice_add(name, spk, prompt_audio, prompt_text, prompt_language, sovits_model):
     import gradio as gr
     if not name or not name.strip():
         raise gr.Error("empty name")
     payload = {"name": name.strip(), "spk": spk, "prompt_audio": prompt_audio,
                "prompt_text": prompt_text, "prompt_language": prompt_language,
-               "sovits_model": None}
+               "sovits_model": (sovits_model or "").strip() or None}
     try:
         r = _call("/voices", payload, method="POST")
         json.loads(r)
@@ -111,7 +136,8 @@ def refresh_voices():
     import gradio as gr
     vs = _voices()
     table = [[k] for k in vs]
-    return gr.Dropdown(choices=vs, value="default"), table
+    dd = gr.Dropdown(choices=vs, value="default")
+    return dd, table, gr.Dropdown(choices=vs, value="default")
 
 
 def main():
@@ -137,10 +163,20 @@ def main():
                     with gr.Row():
                         top_k = gr.Slider(label="top_k", minimum=1, maximum=50, value=15, step=1)
                         verify = gr.Checkbox(label="ASR 质量门（慢但稳）", value=False)
+                    with gr.Row():
+                        cut_minlen = gr.Slider(label="分段长度（弱模型长句糊就调小，如 10）",
+                                               minimum=5, maximum=100, value=30, step=1)
+                        sovits_box = gr.Textbox(label="SoVITS .pth（空=默认，微调音色填路径）", value="")
+                    with gr.Accordion("一次性克隆（上传参考音频，不存预设）", open=False):
+                        pup = gr.Audio(label="参考音频（上传，5秒以上干净干声）",
+                                       type="filepath", sources=["upload"])
+                        ptext = gr.Textbox(label="参考文本（音频里说的内容，一字不差）",
+                                           lines=2, value="")
                     btn = gr.Button("合成", variant="primary")
                 with gr.Column():
                     audio = gr.Audio(label="输出", type="filepath")
-            btn.click(synth, inputs=[text, voice, lang, plang, top_k, verify], outputs=[audio])
+            btn.click(synth, inputs=[text, voice, lang, plang, top_k, verify,
+                                     pup, ptext, cut_minlen, sovits_box], outputs=[audio])
         with gr.Tab("变声"):
             with gr.Row():
                 with gr.Column():
@@ -161,6 +197,7 @@ def main():
                     vpt = gr.Textbox(label="prompt 文本", lines=2,
                                      value="ちが……ちがう。レイア、貴様は間違っている。")
                     vpl = gr.Radio(label="prompt 语言", choices=["ja", "zh", "en"], value="ja")
+                    vsov = gr.Textbox(label="SoVITS .pth（空=默认）", value="")
                     with gr.Row():
                         vadd = gr.Button("保存", variant="primary")
                         vdel = gr.Button("删除所选")
@@ -168,9 +205,10 @@ def main():
                     vtable = gr.Dataframe(label="现有预设", headers=["name"], col_count=(1, "fixed"))
                     vsel = gr.Dropdown(label="选择", choices=_voices(), value="default")
                     vref = gr.Button("刷新列表")
-            vadd.click(voice_add, inputs=[vname, vspk, vpa, vpt, vpl], outputs=[vsel, vtable])
-            vdel.click(voice_del, inputs=[vsel], outputs=[vsel, vtable])
-            vref.click(refresh_voices, outputs=[vsel, vtable])
+            vadd.click(voice_add, inputs=[vname, vspk, vpa, vpt, vpl, vsov],
+                       outputs=[vsel, vtable, voice])
+            vdel.click(voice_del, inputs=[vsel], outputs=[vsel, vtable, voice])
+            vref.click(refresh_voices, outputs=[vsel, vtable, voice])
     app.launch(server_name="0.0.0.0", server_port=args.port)
 
 
