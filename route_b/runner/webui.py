@@ -104,6 +104,7 @@ def synth(text, voice, language, prompt_language, top_k, verify,
         payload["spk"] = up
     if (sovits_model or "").strip():
         payload["sovits_model"] = sovits_model.strip()
+    print(f"webui->api /tts payload: {json.dumps(payload, ensure_ascii=False)[:600]}", flush=True)
     raw = _call("/tts", payload, method="POST")
     try:
         json.loads(raw)
