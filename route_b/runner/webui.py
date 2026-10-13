@@ -56,12 +56,18 @@ def _to_pcm16_wav(raw: bytes) -> bytes:
         return raw
 
 
+_whisper_model = None
+
+
 def _auto_transcribe(wav_path):
-    """参考音频自动转写（small/cpu，慢但免手填）。失败抛异常由调用方转 gr.Error。"""
+    """参考音频自动转写（small/cpu，慢但免手填）。模型常驻，失败抛异常由调用方转 gr.Error。"""
+    global _whisper_model
     import soundfile as sf
     import numpy as np
     from faster_whisper import WhisperModel
-    m = WhisperModel("small", device="cpu", compute_type="int8")
+    if _whisper_model is None:
+        _whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
+    m = _whisper_model
     a, sr = sf.read(wav_path)
     a = np.asarray(a, dtype=np.float64)
     if getattr(a, "ndim", 1) > 1:
