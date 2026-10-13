@@ -83,6 +83,26 @@ def strip_prompt_echo(sampled, prompt, maxk=12, mink=3):
     return sampled
 
 
+_TARGET_DBFS = float(os.environ.get("GSV_TARGET_DBFS", "-20.0"))  # 输出响度目标；设 0 关闭
+
+
+def _normalize_loudness(audio):
+    """RMS 归一化 + 峰值保护（不削波）。克隆 prompt y 偏糊时输出能量低，靠这层拉齐。"""
+    if not _TARGET_DBFS:
+        return audio
+    a = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if a.size == 0:
+        return audio
+    rms = float(np.sqrt(np.mean(a.astype(np.float64) ** 2)))
+    if rms < 1e-7:
+        return audio
+    gain = (10.0 ** (_TARGET_DBFS / 20.0)) / rms
+    peak = float(np.abs(a).max())
+    if peak > 0 and peak * gain > 0.99:
+        gain = 0.99 / peak
+    return (a * gain).astype(np.float32)
+
+
 _Y_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "gsv", "prompt_y")
 _Y_SELECT_N = int(os.environ.get("Y_SELECT_N", "3"))  # resyn 早停，有好即收
 
@@ -440,6 +460,7 @@ def _synth(req: TTSReq) -> str:
     wav = chunks[0]
     for c in chunks[1:]:
         wav = np.concatenate([wav, mute, c])
+    wav = _normalize_loudness(wav)
     out = os.path.join(tempfile.gettempdir(), f"api_tts_{int(time.time()*1000)}.wav")
     sf.write(out, wav, SR)
     _prog = {"state": "idle", "current": 0, "total": 0}
@@ -956,6 +977,7 @@ async def vc_endpoint(file: UploadFile | None = File(None),
     mx = np.abs(a).max()
     if mx > 1:
         a = a / mx
+    a = _normalize_loudness(a)
     a = np.concatenate([a, np.zeros(int(0.2 * SR), dtype=a.dtype)])
     out = os.path.join(tempfile.gettempdir(), f"vc_out_{int(time.time()*1000)}.wav")
     sf.write(out, a, SR)
