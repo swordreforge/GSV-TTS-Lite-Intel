@@ -614,10 +614,11 @@ def _synth_stream(req: StreamReq):
     global _prog
     _prog = {"state": "streaming", "current": 0, "total": len(cuts)}
     gex = ge.to("xpu")
+    gated_head = False  # 首窗门：只验第 0 段首个音频窗（泄漏住头部）
     with tempfile.TemporaryDirectory(prefix="api_stream_") as wd:
         for i, tc in enumerate(cuts):
             _prog = {"state": "streaming", "current": i + 1, "total": len(cuts)}
-            phones2, _, bert2, _ = get_phones_and_bert(tc, tts.tts_config, req.language)
+            phones2, _, bert2, norm_txt = get_phones_and_bert(tc, tts.tts_config, req.language)
             x = torch.LongTensor(phones1 + phones2).unsqueeze(0)
             bert = torch.cat([bert1, bert2]).unsqueeze(0)
             jd = os.path.join(wd, f"c{i}")
@@ -685,7 +686,12 @@ def _synth_stream(req: StreamReq):
                                 top_k=req.top_k, seed=base_seed + i, rep=req.repetition_penalty,
                                 on_token=on_token)
             while not q.empty():
-                yield q.get().astype(np.float32).tobytes()
+                b = q.get().astype(np.float32).tobytes()
+                if i == 0 and req.verify and not gated_head:
+                    gated_head = True
+                    if not _chunk_passes(np.frombuffer(b, np.float32), norm_txt, req.language):
+                        raise RuntimeError("stream head gate failed")
+                yield b
             # final flush：首个 EOS 截断 + 回声剥离（同非流式规则）
             seq = np.array(sampled[1:], dtype=np.int64)
             eos = np.where(seq == EOS)[0]
@@ -696,7 +702,12 @@ def _synth_stream(req: StreamReq):
             seq = seq[skip:]
             if len(seq) > emitted:
                 pcm = decode_window(seq, True)
-                yield pcm.astype(np.float32).tobytes()
+                b = pcm.astype(np.float32).tobytes()
+                if i == 0 and req.verify and not gated_head:
+                    gated_head = True
+                    if not _chunk_passes(np.frombuffer(b, np.float32), norm_txt, req.language):
+                        raise RuntimeError("stream head gate failed")
+                yield b
     _prog = {"state": "idle", "current": 0, "total": 0}
 
 
