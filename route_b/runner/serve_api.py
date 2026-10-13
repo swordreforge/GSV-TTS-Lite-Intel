@@ -254,6 +254,17 @@ def _get_tts():
     return _tts, _tts_x
 
 
+def _prepare_sv(tts, tts_x, sv_path, spk):
+    """svx = XPU 模型（解码用）；ge = 在 CPU 上计算再上卡。
+    根因：XPU 版 _prepare_sovits_resources 算出的 ge 喂给 decode 会 native 段错误
+    （隔离 A/B 实锤：CPU ge 3/3 干净、XPU ge 必崩，见 INTEL_XPU.md）。返回 (svx, ge_cpu)。"""
+    if sv_path not in tts_x.sovits_models:
+        tts_x.load_sovits_model(sv_path)
+    svx = tts_x.sovits_models[sv_path].vq_model.eval()
+    _, ge = tts._prepare_sovits_resources(sv_path, spk)  # 关键：CPU 算 ge
+    return svx, ge
+
+
 @contextlib.contextmanager
 def _lease_runner():
     """轮询租一个空闲 runner；全忙则阻塞等第一个。请求级并行，长文本不再独占全服。"""
@@ -323,8 +334,7 @@ def _synth(req: TTSReq) -> str:
     tts, tts_x = _get_tts()
     tts.init_language_module(req.language, req.prompt_language)
     sv_path = req.sovits_model or str(tts.default_sovits_path)
-    sovits_m, ge = tts_x._prepare_sovits_resources(sv_path, req.spk)
-    svx = sovits_m.vq_model.eval()
+    svx, ge = _prepare_sv(tts, tts_x, sv_path, req.spk)
     gpt_m, prompt, phones1, bert1 = tts._prepare_gpt_resources(
         str(tts.default_gpt_path), req.prompt_audio, req.prompt_text, req.prompt_language)
     prompt = _resolve_prompt(
@@ -715,9 +725,9 @@ def _synth_stream(req: StreamReq):
     tts, tts_x = _get_tts()
     tts.init_language_module(req.language, req.prompt_language)
     sv_path = req.sovits_model or str(tts.default_sovits_path)
-    sovits_m, ge = tts_x._prepare_sovits_resources(sv_path, req.spk)
-    svx = sovits_m.vq_model.eval()
+    svx, ge = _prepare_sv(tts, tts_x, sv_path, req.spk)
     overlap_samples = req.overlap_len * svx.samples_per_frame
+    gex = ge.to("xpu")
     gpt_m, prompt, phones1, bert1 = tts._prepare_gpt_resources(
         str(tts.default_gpt_path), req.prompt_audio, req.prompt_text, req.prompt_language)
     prompt = _resolve_prompt(
@@ -729,7 +739,6 @@ def _synth_stream(req: StreamReq):
         raise ValueError("empty text after cut")
     global _prog
     _prog = {"state": "streaming", "current": 0, "total": len(cuts)}
-    gex = ge.to("xpu")
     gated_head = False  # 首窗门：只验第 0 段首个音频窗（泄漏住头部）
     with tempfile.TemporaryDirectory(prefix="api_stream_") as wd:
         for i, tc in enumerate(cuts):
@@ -900,9 +909,8 @@ async def vc_endpoint(file: UploadFile | None = File(None),
     tts, tts_x = _get_tts()
     tts.init_language_module("ja", "zh", "en")
     sv_path = sovits_model or str(tts.default_sovits_path)
-    sov_cpu, _ = tts._prepare_sovits_resources(sv_path, spk)
-    sovits_m, ge = tts_x._prepare_sovits_resources(sv_path, spk)
-    svx = sovits_m.vq_model.eval()
+    svx, ge = _prepare_sv(tts, tts_x, sv_path, spk)
+    sov_cpu = tts.sovits_models[sv_path]  # y 提取用 CPU sovits（extract_latent）
     if tts.cnhubert_model is None:
         from gsv_tts.GPT_SoVITS.Featurizer import CNHubert
         tts.cnhubert_model = CNHubert(tts.cnhubert_path, tts.tts_config)
