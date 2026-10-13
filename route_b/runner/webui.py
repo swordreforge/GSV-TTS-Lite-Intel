@@ -60,7 +60,7 @@ _whisper_model = None
 
 
 def _auto_transcribe(wav_path):
-    """参考音频自动转写（small/cpu，慢但免手填）。模型常驻，失败抛异常由调用方转 gr.Error。"""
+    """参考音频自动转写（small/cpu，慢但免手填）。返回 (text, lang)。模型常驻。"""
     global _whisper_model
     import soundfile as sf
     import numpy as np
@@ -74,8 +74,11 @@ def _auto_transcribe(wav_path):
         a = a.mean(axis=-1)
     n = max(1, int(len(a) * 16000 / sr))
     a16 = np.interp(np.linspace(0, len(a), n), np.arange(len(a)), a).astype(np.float32)
-    segs, _ = m.transcribe(a16, beam_size=5)
-    return "".join(s.text for s in segs).strip()
+    segs, info = m.transcribe(a16, beam_size=5)
+    txt = "".join(s.text for s in segs).strip()
+    lang = (getattr(info, "language", None) or "").lower()
+    lang = {"zh": "zh", "ja": "ja", "en": "en"}.get(lang, "")
+    return txt, lang
 
 
 def synth(text, voice, language, prompt_language, top_k, verify,
@@ -92,13 +95,18 @@ def synth(text, voice, language, prompt_language, top_k, verify,
             up = _save_upload(prompt_upload)
         except Exception as e:
             raise gr.Error(f"上传保存失败: {e}")
+        # 上传即自动转写+检测语言：覆盖用户选错的参考语言（ja 前端啃中文会摆烂）
+        auto_txt, auto_lang = "", ""
+        try:
+            auto_txt, auto_lang = _auto_transcribe(up)
+        except Exception as e:
+            print(f"auto-transcribe failed: {e}", flush=True)
         if not (prompt_text or "").strip():
-            try:
-                prompt_text = _auto_transcribe(up)
-            except Exception as e:
-                raise gr.Error(f"参考音频自动转写失败（{e}），请手动填写参考文本")
-            if not prompt_text:
-                raise gr.Error("参考音频转写为空，请手动填写参考文本")
+            if not auto_txt:
+                raise gr.Error("参考音频转写为空且未填参考文本，请手动填写")
+            prompt_text = auto_txt
+        if auto_lang:
+            payload["prompt_language"] = auto_lang
         payload["prompt_audio"] = up
         payload["prompt_text"] = prompt_text.strip()
         payload["spk"] = up
