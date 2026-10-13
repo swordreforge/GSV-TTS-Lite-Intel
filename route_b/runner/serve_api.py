@@ -60,7 +60,10 @@ def _resolve_prompt(prompt, audio_path, prompt_text, lang, resyn=None):
         print(f"prompt y overridden from {_pyf}", flush=True)
         return prompt
     try:
-        ybin = ensure_good_y(audio_path, prompt_text, lang, resyn=resyn)
+        ybin, _ = ensure_good_y(audio_path, prompt_text, lang, resyn=resyn)
+        if ybin is None:
+            print("prompt y auto-select rejected, using prepared", flush=True)
+            return prompt
         prompt = torch.from_numpy(np.fromfile(ybin, np.int64).reshape(1, -1))
         print(f"prompt y auto-selected: {ybin}", flush=True)
     except Exception as e:
@@ -131,83 +134,96 @@ def _resyn_score(ybin, prompt_text, lang, svx, ge, tts):
     return r
 
 
+_Y_PASS = 0.25  # resyn-ratio 及格线（AnAn.good=0.35；0.05 级别必糊）
+
+
 def ensure_good_y(audio_path, prompt_text="?", lang="?", n_try=None, resyn=None):
-    """新音频 y 自动优选：extract_y × N（串行+线程轮换逼出调度差异）。
-    resyn 回调(ybin)->ratio 存在时按内容分选优（早停≥0.6），否则退化到 uniq 占比。"""
-    """新音频 y 自动优选：extract_y × N（并行子进程），uniq 占比最高者落盘缓存。
-    同进程重复提取无意义（0 漂移），必须跨进程抽签。返回 y 文件路径。"""
+    """新音频 y 自动优选：extract（串行+线程轮换）→ 逐个 resyn 验证 → 过线即停。
+    低于及格线不缓存（防投毒）。返回 (ybin_or_None, best_ratio)。
+    resyn=None 时退化到 uniq 占比（老行为，阈值 0.35）。"""
     n_try = n_try or _Y_SELECT_N
     ybin, meta = _y_cache_key(audio_path, prompt_text, lang)
     if os.path.exists(ybin):
         print(f"prompt y cache hit: {ybin}", flush=True)
-        return ybin
+        return ybin, 1.0
     os.makedirs(_Y_CACHE_DIR, exist_ok=True)
     _ensure_oneapi_env()
-    cands = []
+    import shutil
     # 串行抽签（并行同负载调度一致，无意义）+ 轮换线程数逼出调度差异
     thread_cycle = ["16", "1", "4", "8", "2"]
-    stats = []
-    import shutil
+    tried = []
     for k in range(n_try):
         out = os.path.join(tempfile.gettempdir(), f"ysel_{os.getpid()}_{k}.bin")
         env = dict(os.environ)
         env["SYCL_CACHE_PERSISTENT"] = "0"
         env["OMP_NUM_THREADS"] = thread_cycle[k % len(thread_cycle)]
         env["MKL_NUM_THREADS"] = thread_cycle[k % len(thread_cycle)]
+        ok, score, meta_k, ratio = False, 0.0, {}, None
         try:
             r = subprocess.run(
                 [sys.executable, os.path.join(_HERE, "extract_y.py"), audio_path, out, "xpu"],
                 env=env, capture_output=True, text=True, timeout=900)
             print(f"y-select cand {k} (threads={thread_cycle[k % len(thread_cycle)]}): "
                   f"{r.stdout.strip().splitlines()[-1] if r.stdout.strip() else 'no-output'}", flush=True)
+            if r.returncode != 0 or not os.path.exists(out):
+                print(f"y-select cand {k}: FAILED rc={r.returncode}", flush=True)
+                continue
+            score, meta_k = _y_score(out)
+            if resyn is not None:
+                ratio = resyn(out)
+                meta_k["resyn_ratio"] = round(ratio, 4)
+            ok = True
         except subprocess.TimeoutExpired:
             print(f"y-select cand {k}: TIMEOUT", flush=True)
-            continue
-        if r.returncode != 0 or not os.path.exists(out):
-            print(f"y-select cand {k}: FAILED rc={r.returncode}", flush=True)
-            continue
-        score, meta_k = _y_score(out)
-        stats.append((score, k, out, meta_k))
-        cands.append(out)
-    if not stats:
+        except Exception as e:
+            print(f"y-select cand {k}: ERROR ({e})", flush=True)
+        finally:
+            if ok:
+                tried.append((ratio if ratio is not None else score, k, out, meta_k))
+            elif os.path.exists(out):
+                try:
+                    os.remove(out)
+                except OSError:
+                    pass
+        if ok and ratio is not None and ratio >= 0.3:
+            print(f"y-select cand {k}: resyn {ratio:.3f} confident, stop", flush=True)
+            break
+        if ratio is not None and ratio >= 0.3:
+            print(f"y-select cand {k}: resyn {ratio:.3f} confident, stop", flush=True)
+            break
+    if not tried:
         raise RuntimeError("y-select: all extractions failed")
-    stats.sort(key=lambda t: -t[0])
-    if resyn is not None:
-        # 内容分复选：逐个重合成打分，≥0.3 早停，否则取最高
-        rescored = []
-        for score, k, out, meta_k in stats:
+    tried.sort(key=lambda t: -t[0])
+    best, best_k, best_out, best_meta = tried[0]
+    if resyn is not None and best < _Y_PASS:
+        for _, _, c, _ in tried:
             try:
-                r = resyn(out)
-            except Exception as e:
-                print(f"y-select cand {k}: resyn failed ({e})", flush=True)
-                continue
-            meta_k["resyn_ratio"] = round(r, 4)
-            rescored.append((r, k, out, meta_k))
-            if r >= 0.3:
-                print(f"y-select cand {k}: resyn {r:.3f} good enough, stop", flush=True)
-                break
-        if rescored:
-            rescored.sort(key=lambda t: -t[0])
-            stats = rescored
-    best_score, best_k, best_out, best_meta = stats[0]
+                os.remove(c)
+            except OSError:
+                pass
+        print(f"y-select: best {best:.3f} < {_Y_PASS}, NOT cached (refusing to serve garbage). "
+              f"retry later or supply cleaner source audio.", flush=True)
+        return None, best
     shutil.copyfile(best_out, ybin)
     meta_doc = dict(best_meta)
     meta_doc.update({"audio": audio_path, "prompt_text": prompt_text, "lang": lang,
-                     "score": round(best_score, 4), "n_try": n_try,
-                     "all": [{"score": round(s, 4), **m} for s, _, _, m in stats]})
+                     "score": round(best, 4), "n_try": n_try,
+                     "all": [{"score": (round(s, 4) if isinstance(s, float) else s), **m}
+                             for s, _, _, m in tried]})
     with open(meta, "w") as f:
         json.dump(meta_doc, f, ensure_ascii=False, indent=1)
-    for c in cands:
-        try:
-            os.remove(c)
-        except OSError:
-            pass
-    print(f"prompt y selected: {ybin} score={best_score:.3f} {best_meta}", flush=True)
-    _thr = 0.25 if resyn is not None else 0.35
-    if best_score < _thr:
-        print(f"WARNING: y looks collapsed (score={best_score:.3f}); "
-              f"expect rambling — re-extract or curate manually, see INTEL_XPU.md", flush=True)
-    return ybin
+    for _, _, c, _ in tried:
+        if c != best_out:
+            try:
+                os.remove(c)
+            except OSError:
+                pass
+    try:
+        os.remove(best_out)
+    except OSError:
+        pass
+    print(f"prompt y selected: {ybin} score={best:.3f} {best_meta}", flush=True)
+    return ybin, best
 
 
 _POOL_SIZE = max(1, int(os.environ.get("RUNNER_POOL", "2")))
@@ -522,8 +538,8 @@ def refresh_prompt(prompt_audio: str = "examples/AnAn.ogg",
             deleted += 1
         except OSError:
             pass
-    ybin = ensure_good_y(prompt_audio, prompt_text, lang)
-    return {"ybin": ybin, "deleted": deleted}
+    ybin, ratio = ensure_good_y(prompt_audio, prompt_text, lang)
+    return {"ybin": ybin, "ratio": ratio, "deleted": deleted}
 
 
 def _ensure_oneapi_env():
@@ -864,11 +880,16 @@ async def vc_endpoint(file: UploadFile | None = File(None),
     lang = prompt_language if prompt_language != "auto" else (heard_lang or "ja")
     prompt = tts._get_prompt(tts.cnhubert_model, sov_cpu, src)
     try:
-        ybin = ensure_good_y(
+        ybin, _ = ensure_good_y(
             src, prompt_text, lang,
             resyn=lambda yb: _resyn_score(yb, prompt_text, lang, svx, ge, tts))
+        if ybin is None:
+            raise HTTPException(500, "prompt quality check failed (y collapsed); "
+                                     "retry later or supply cleaner source audio")
         prompt = torch.from_numpy(np.fromfile(ybin, np.int64).reshape(1, -1))
         print(f"vc prompt y: {ybin}", flush=True)
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"vc y auto-select failed ({e}), using extracted", flush=True)
     from gsv_tts.TTS import get_phones_and_bert
