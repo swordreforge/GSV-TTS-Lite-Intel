@@ -158,134 +158,6 @@ def ensure_good_y(audio_path, prompt_text="?", lang="?", n_try=None):
     return ybin
 
 
-@app.post("/refresh_prompt")
-def refresh_prompt(prompt_audio: str = "examples/AnAn.ogg",
-                   prompt_text: str = "?", lang: str = "?"):
-    """删缓存重提 y（抽签，返回统计；uniq 高者赢，服务重启或下次请求生效）。"""
-    import glob as _glob
-    deleted = 0
-    for f in _glob.glob(os.path.join(_Y_CACHE_DIR, "*")):
-        if ".good." in os.path.basename(f):
-            continue  # curated 资产不动
-        try:
-            os.remove(f)
-            deleted += 1
-        except OSError:
-            pass
-    ybin = ensure_good_y(prompt_audio, prompt_text, lang)
-    return {"ybin": ybin, "deleted": deleted}
-
-
-def _ensure_oneapi_env():
-    if os.environ.get("ONEAPI_ROOT"):
-        return
-    sv = "/opt/intel/oneapi/setvars.sh"
-    if not os.path.exists(sv):
-        return
-    out = subprocess.run(["bash", "-c", f"source {sv} >/dev/null 2>&1 && env -0"],
-                         capture_output=True, check=True).stdout
-    for entry in out.decode().split("\0"):
-        if "=" in entry:
-            k, v = entry.split("=", 1)
-            os.environ[k] = v
-
-
-class RunnerServer:
-    """runner --serve 常驻进程，一次 JOB 一收发（调用方加锁串行）。"""
-
-    def __init__(self):
-        _ensure_oneapi_env()
-        self._env = dict(os.environ)
-        self._env["SYCL_CACHE_PERSISTENT"] = "0"  # 持久缓存本环境段错误，见 INTEL_XPU.md
-        self._env["RUNNER_STREAM"] = "1"  # 每步打印 TOK <id>，job() 会忽略，job_stream() 消费
-        if os.environ.get("GPT_GGUF"):  # 微调 GPT 的 gguf，重启服务切换
-            self._env["RUNNER_GGUF"] = os.environ["GPT_GGUF"]
-        self._spawn()
-
-    def _spawn(self):
-        self.p = subprocess.Popen([RUNNER_BIN, "--serve"], stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                  text=True, bufsize=1, env=self._env)
-        while True:
-            line = self.p.stdout.readline()
-            if not line:
-                raise RuntimeError("runner serve exited during init")
-            if "SERVE-READY" in line:
-                return
-
-    def _ensure_alive(self):
-        if self.p.poll() is not None:  # runner 死了就地重拉（约1s + 下一 JOB 重新 JIT）
-            print("runner dead, respawning...", flush=True)
-            self._spawn()
-
-    def job(self, indir, out, top_k=15, seed=1234, rep=1.35, timeout=1200):
-        self._ensure_alive()
-        self.p.stdin.write(f"JOB {indir} {out} {top_k} {seed} {rep}\n")
-        self.p.stdin.flush()
-        t0 = time.time()
-        while True:
-            if time.time() - t0 > timeout:
-                raise TimeoutError("runner JOB timeout")
-            line = self.p.stdout.readline()
-            if not line:
-                raise RuntimeError("runner serve pipe closed")
-            if line.startswith("JOB-DONE"):
-                parts = dict(kv.split("=") for kv in line.strip().split()[1:])
-                return int(parts["ntoks"]), float(parts["ms"])
-            if line.startswith("JOB-ERR"):
-                raise RuntimeError(f"runner: {line.strip()}")
-
-    def job_stream(self, indir, out, top_k=15, seed=1234, rep=1.35, on_token=None, timeout=1200):
-        """JOB 并逐 token 回调（RUNNER_STREAM=1 时 runner 每步打印 TOK <id>）。"""
-        self._ensure_alive()
-        self.p.stdin.write(f"JOB {indir} {out} {top_k} {seed} {rep}\n")
-        self.p.stdin.flush()
-        t0 = time.time()
-        while True:
-            if time.time() - t0 > timeout:
-                raise TimeoutError("runner JOB timeout")
-            line = self.p.stdout.readline()
-            if not line:
-                raise RuntimeError("runner serve pipe closed")
-            if line.startswith("TOK ") and on_token is not None:
-                try:
-                    on_token(int(line.split()[1]))
-                except ValueError:
-                    pass
-            elif line.startswith("JOB-DONE"):
-                parts = dict(kv.split("=") for kv in line.strip().split()[1:])
-                return int(parts["ntoks"]), float(parts["ms"])
-            elif line.startswith("JOB-ERR"):
-                raise RuntimeError(f"runner: {line.strip()}")
-
-    def close(self):
-        try:
-            self.p.stdin.write("QUIT\n")
-            self.p.stdin.flush()
-            self.p.wait(timeout=10)
-        except Exception:
-            self.p.kill()
-
-
-class TTSReq(BaseModel):
-    text: str
-    spk: str = "examples/laffey.mp3"
-    prompt_audio: str = "examples/AnAn.ogg"
-    prompt_text: str = "ちが……ちがう。レイア、貴様は間違っている。"
-    language: str = "ja"
-    prompt_language: str = "ja"  # 必须与 prompt 音频/文本的真实语言一致，否则 prompt 条件全错
-    top_k: int = 15  # greedy 短句易塌成静音，默认随机采样
-    noise_scale: float = 0.5  # 上游默认；0=确定性但发 flat/金属（parity 工具仍用 0）
-    repetition_penalty: float = 1.35
-    seed: int | None = None  # None=每次随机；固定 seed 则回声等问题可复现
-    verify: bool = False  # ASR 质量门：chunk 转写对不上目标头就重抽（最多 max_retries 次）
-    max_retries: int = 2
-    cut_minlen: int = 30  # 段越少总耗时越短；太大单段易撞 K=1024 上限被截断
-    cut_mute: float = 0.4  # 段间静音秒数
-    sovits_model: str | None = None  # 微调 .pth 即插即用；None=默认
-    # GPT 微调切换=换 gguf，需重启服务（GPT_GGUF 环境变量指向新 gguf，多模型=多端口实例）
-
-
 app = FastAPI(title="GSV-TTS-Lite Intel API")
 _lock = threading.Lock()
 _prog = {"state": "idle", "current": 0, "total": 0}  # 原子替换读，无锁可读
@@ -456,6 +328,134 @@ def _chunk_passes(audio_np, norm_text, language):
 @app.get("/progress")
 def progress():
     return _prog
+
+
+@app.post("/refresh_prompt")
+def refresh_prompt(prompt_audio: str = "examples/AnAn.ogg",
+                   prompt_text: str = "?", lang: str = "?"):
+    """删缓存重提 y（抽签，返回统计；uniq 高者赢，服务重启或下次请求生效）。"""
+    import glob as _glob
+    deleted = 0
+    for f in _glob.glob(os.path.join(_Y_CACHE_DIR, "*")):
+        if ".good." in os.path.basename(f):
+            continue  # curated 资产不动
+        try:
+            os.remove(f)
+            deleted += 1
+        except OSError:
+            pass
+    ybin = ensure_good_y(prompt_audio, prompt_text, lang)
+    return {"ybin": ybin, "deleted": deleted}
+
+
+def _ensure_oneapi_env():
+    if os.environ.get("ONEAPI_ROOT"):
+        return
+    sv = "/opt/intel/oneapi/setvars.sh"
+    if not os.path.exists(sv):
+        return
+    out = subprocess.run(["bash", "-c", f"source {sv} >/dev/null 2>&1 && env -0"],
+                         capture_output=True, check=True).stdout
+    for entry in out.decode().split("\0"):
+        if "=" in entry:
+            k, v = entry.split("=", 1)
+            os.environ[k] = v
+
+
+class RunnerServer:
+    """runner --serve 常驻进程，一次 JOB 一收发（调用方加锁串行）。"""
+
+    def __init__(self):
+        _ensure_oneapi_env()
+        self._env = dict(os.environ)
+        self._env["SYCL_CACHE_PERSISTENT"] = "0"  # 持久缓存本环境段错误，见 INTEL_XPU.md
+        self._env["RUNNER_STREAM"] = "1"  # 每步打印 TOK <id>，job() 会忽略，job_stream() 消费
+        if os.environ.get("GPT_GGUF"):  # 微调 GPT 的 gguf，重启服务切换
+            self._env["RUNNER_GGUF"] = os.environ["GPT_GGUF"]
+        self._spawn()
+
+    def _spawn(self):
+        self.p = subprocess.Popen([RUNNER_BIN, "--serve"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  text=True, bufsize=1, env=self._env)
+        while True:
+            line = self.p.stdout.readline()
+            if not line:
+                raise RuntimeError("runner serve exited during init")
+            if "SERVE-READY" in line:
+                return
+
+    def _ensure_alive(self):
+        if self.p.poll() is not None:  # runner 死了就地重拉（约1s + 下一 JOB 重新 JIT）
+            print("runner dead, respawning...", flush=True)
+            self._spawn()
+
+    def job(self, indir, out, top_k=15, seed=1234, rep=1.35, timeout=1200):
+        self._ensure_alive()
+        self.p.stdin.write(f"JOB {indir} {out} {top_k} {seed} {rep}\n")
+        self.p.stdin.flush()
+        t0 = time.time()
+        while True:
+            if time.time() - t0 > timeout:
+                raise TimeoutError("runner JOB timeout")
+            line = self.p.stdout.readline()
+            if not line:
+                raise RuntimeError("runner serve pipe closed")
+            if line.startswith("JOB-DONE"):
+                parts = dict(kv.split("=") for kv in line.strip().split()[1:])
+                return int(parts["ntoks"]), float(parts["ms"])
+            if line.startswith("JOB-ERR"):
+                raise RuntimeError(f"runner: {line.strip()}")
+
+    def job_stream(self, indir, out, top_k=15, seed=1234, rep=1.35, on_token=None, timeout=1200):
+        """JOB 并逐 token 回调（RUNNER_STREAM=1 时 runner 每步打印 TOK <id>）。"""
+        self._ensure_alive()
+        self.p.stdin.write(f"JOB {indir} {out} {top_k} {seed} {rep}\n")
+        self.p.stdin.flush()
+        t0 = time.time()
+        while True:
+            if time.time() - t0 > timeout:
+                raise TimeoutError("runner JOB timeout")
+            line = self.p.stdout.readline()
+            if not line:
+                raise RuntimeError("runner serve pipe closed")
+            if line.startswith("TOK ") and on_token is not None:
+                try:
+                    on_token(int(line.split()[1]))
+                except ValueError:
+                    pass
+            elif line.startswith("JOB-DONE"):
+                parts = dict(kv.split("=") for kv in line.strip().split()[1:])
+                return int(parts["ntoks"]), float(parts["ms"])
+            elif line.startswith("JOB-ERR"):
+                raise RuntimeError(f"runner: {line.strip()}")
+
+    def close(self):
+        try:
+            self.p.stdin.write("QUIT\n")
+            self.p.stdin.flush()
+            self.p.wait(timeout=10)
+        except Exception:
+            self.p.kill()
+
+
+class TTSReq(BaseModel):
+    text: str
+    spk: str = "examples/laffey.mp3"
+    prompt_audio: str = "examples/AnAn.ogg"
+    prompt_text: str = "ちが……ちがう。レイア、貴様は間違っている。"
+    language: str = "ja"
+    prompt_language: str = "ja"  # 必须与 prompt 音频/文本的真实语言一致，否则 prompt 条件全错
+    top_k: int = 15  # greedy 短句易塌成静音，默认随机采样
+    noise_scale: float = 0.5  # 上游默认；0=确定性但发 flat/金属（parity 工具仍用 0）
+    repetition_penalty: float = 1.35
+    seed: int | None = None  # None=每次随机；固定 seed 则回声等问题可复现
+    verify: bool = False  # ASR 质量门：chunk 转写对不上目标头就重抽（最多 max_retries 次）
+    max_retries: int = 2
+    cut_minlen: int = 30  # 段越少总耗时越短；太大单段易撞 K=1024 上限被截断
+    cut_mute: float = 0.4  # 段间静音秒数
+    sovits_model: str | None = None  # 微调 .pth 即插即用；None=默认
+    # GPT 微调切换=换 gguf，需重启服务（GPT_GGUF 环境变量指向新 gguf，多模型=多端口实例）
 
 
 class StreamReq(TTSReq):
