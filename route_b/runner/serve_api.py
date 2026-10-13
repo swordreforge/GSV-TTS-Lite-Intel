@@ -808,6 +808,12 @@ async def vc_endpoint(file: UploadFile | None = File(None),
             raise HTTPException(500, f"auto-transcribe failed, pass prompt_text explicitly: {e}")
     lang = prompt_language if prompt_language != "auto" else (heard_lang or "ja")
     prompt = tts._get_prompt(tts.cnhubert_model, sov_cpu, src)
+    try:
+        ybin = ensure_good_y(src, prompt_text, lang)
+        prompt = torch.from_numpy(np.fromfile(ybin, np.int64).reshape(1, -1))
+        print(f"vc prompt y: {ybin}", flush=True)
+    except Exception as e:
+        print(f"vc y auto-select failed ({e}), using extracted", flush=True)
     from gsv_tts.TTS import get_phones_and_bert
     phones, _, _, _ = get_phones_and_bert(prompt_text, tts.tts_config, lang)
     with torch.inference_mode():
