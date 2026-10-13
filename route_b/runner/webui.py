@@ -42,6 +42,20 @@ def _voices():
         return ["default"]
 
 
+def _to_pcm16_wav(raw: bytes) -> bytes:
+    """float32 wav → PCM_16 wav（Firefox 解不了 float32，Chrome 行）。失败时原样返回。"""
+    try:
+        import io
+        import soundfile as sf
+        import numpy as np
+        a, sr = sf.read(io.BytesIO(raw), dtype="float32")
+        buf = io.BytesIO()
+        sf.write(buf, np.asarray(a, dtype=np.float32), sr, subtype="PCM_16", format="WAV")
+        return buf.getvalue()
+    except Exception:
+        return raw
+
+
 def synth(text, voice, language, prompt_language, top_k, verify,
           prompt_upload, prompt_text, cut_minlen, sovits_model):
     import gradio as gr
@@ -71,7 +85,7 @@ def synth(text, voice, language, prompt_language, top_k, verify,
         pass
     fd, path = tempfile.mkstemp(suffix=".wav", prefix="webui_tts_")
     with os.fdopen(fd, "wb") as f:
-        f.write(raw)
+        f.write(_to_pcm16_wav(raw))
     return path
 
 
@@ -100,7 +114,7 @@ def vc_convert(src_audio, spk_voice, prompt_text, prompt_language):
         raise gr.Error(f"API error {r.status_code}: {r.text[:200]}")
     fd, path = tempfile.mkstemp(suffix=".wav", prefix="webui_vc_")
     with os.fdopen(fd, "wb") as f:
-        f.write(r.content)
+        f.write(_to_pcm16_wav(r.content))
     return path
 
 
