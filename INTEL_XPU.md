@@ -358,6 +358,12 @@ RoBERTa 这种纯矩阵小算子本来就跑在 boost 频率上，基本不受�
 - **克隆修复验收**：原样前端参数（上传 32uwgy + ja 目标）修复前 0/9（SEGV/500），
   修复后 9/9 成功、服务不倒；输出 ASR="こんにちは" 内容正确。三重修复：ge 改 CPU 算（根治 SEGV）+ 上传自动检测参考语言
   （治语言错配摆烂）+ 空生成无条件重试 3 次（治残余偶发空生成）。
+- **模型/资产持久化（2026-10-15 重建）**：`~/.cache/gsv` 曾被当缓存清掉导致全灭（底模+gguf+runner+OV+y缓存+日志）。
+  现改存 `~/models/gsv/`（bin/gguf/prompt_y/uploads/log/ov_models + s1v3.ckpt/s2Gv2ProPlus.pth/hubert/roberta/g2p/sv），
+  `~/.cache/gsv` 仅为指向它的软链（代码零改动；清理 `~/.cache` 顶多断链，数据无恙，重链即恢复）。
+  重建顺序：底模自动下载 → gguf 转（295 tensors）→ runner 重链（llama `build-sycl` 产物仍在）→ OV 双导出 →
+  AnAn.good 重抽（184/94/0，与原文件同签名，OV 确定性成立）→ 起服务冒烟（こんにちは ASR 全对）。
+  注意：`s1v3.ckpt`/`s2Gv2ProPlus.pth` 不走自动下载（首次需确认来源）；`luming` 微调包仍在仓库目录（gitignore）。
 - **服务持久化**：`gsv-api.service` + `gsv-webui.service`（systemd user unit，linger 已开，重启/掉线自拉起）；日志落 `~/.cache/gsv/log/api.log|webui.log`（/tmp 重启会清）。
 - **音色管理**：`/voices` 增删改查 + `voice=` 一键切换（显式字段优先），已全流程验收。
 - **服务整洁**：lifespan（去 on_event 告警）+ 启动预热（两 runner 各一次 tiny 合成）+
