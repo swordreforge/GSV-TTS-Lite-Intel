@@ -48,6 +48,15 @@
 
 ## 关于项目 (About)
 
+> **本项目是 [`chinokikiss/GSV-TTS-Lite`](https://github.com/chinokikiss/GSV-TTS-Lite) 的 Intel 分支（fork）。**
+>
+> - **上游原作者**：[@chinokikiss](https://github.com/chinokikiss)，Licensed under **MIT**（见 [`LICENSE`](LICENSE)，版权归原作者）。
+> - **本分支（`GSV-TTS-Lite-Intel`）** 在上游基础上增加了 **Intel XPU（Arc 核显 / 独显）** 推理支持：`torch XPU` + `openvino` 文本前端/Hubert、基于 **ggml + SYCL** 的 C++ GPT 解码后端、FastAPI 服务化、VC 与 WebUI 增强等。
+> - 完整改动、基准、决策与被证伪路线的复现记录见 [`INTEL_XPU.md`](INTEL_XPU.md)；一次线上克隆崩溃的完整复盘见 [`route_b/validation/CLONE_DEBUG_REPORT.md`](route_b/validation/CLONE_DEBUG_REPORT.md)。
+> - 上游的原始说明（含 NVIDIA CUDA / Apple MPS 路径）继续保留在下方；Intel 专用部署请以 `INTEL_XPU.md` 为准。
+>
+> This repository is an **Intel (XPU) fork** of [`chinokikiss/GSV-TTS-Lite`](https://github.com/chinokikiss/GSV-TTS-Lite). All original work is © the upstream author (MIT). See `INTEL_XPU.md` for Intel-specific changes.
+
 本项目诞生的初衷源于对极致性能的追求。我在原版 GPT-SoVITS 的使用过程中，受限于 RTX 3050 (Laptop) 的算力瓶颈，推理延迟往往难以满足实时交互的需求。
 
 为了打破这一限制，**GSV-TTS-Lite** 应运而生，它是基于 **GPT-SoVITS (V2/V2Pro/V2ProPlus)** 开发的推理后端。通过一些深度优化技术，本项目成功在低显存环境下实现了毫秒级的实时响应。
